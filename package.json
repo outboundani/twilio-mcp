@@ -1,0 +1,14 @@
+{
+  "name": "twilio-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Twilio on Cloudflare Workers - it builds, not just reads (TaskRouter queues and workflows, and real Studio IVRs composed from one portable spec)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "node --test",
+    "smoke": "node scripts/live-smoke.mjs"
+  },
+  "license": "MIT"
+}

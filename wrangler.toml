@@ -1,0 +1,18 @@
+name = "twilio-mcp"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# Configuration comes from one of two places (env wins if both are set):
+#   1. The in-browser setup wizard at /setup - stores config in the KV
+#      namespace below. Easiest path; no terminal needed after deploy.
+#   2. Wrangler secrets (`npx wrangler secret put <NAME>`):
+#      TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID / TWILIO_API_KEY_SECRET /
+#      MCP_AUTH_TOKEN
+#
+# KV namespace for wizard-managed config. The `id` is intentionally omitted so
+# the namespace is auto-provisioned into the deploying account: the "Deploy to
+# Cloudflare" button and `npx wrangler deploy` both create it and write the id
+# back to this file on first deploy. (If you'd rather pin an existing namespace,
+# run `npx wrangler kv namespace create CONFIG` and add `id = "..."` below.)
+[[kv_namespaces]]
+binding = "CONFIG"

@@ -1,0 +1,25 @@
+{
+  "name": "Main_Line",
+  "language": "en-US",
+  "greeting": "Thanks for calling Acme Home Services.",
+  "hours": {
+    "timezone": "America/New_York",
+    "schedule": [{ "days": ["monday", "tuesday", "wednesday", "thursday", "friday"], "start": "08:00", "end": "18:00" }],
+    "closed": { "message": "We're closed right now.", "then": { "type": "voicemail", "message": "Leave a message after the tone." } }
+  },
+  "menu": {
+    "prompt": "For sales, press 1. For support, press 2. For billing, press 3.",
+    "options": [
+      { "digit": "1", "label": "Sales", "action": { "type": "transfer_to_queue", "queue": "Sales", "message": "Connecting you to sales." } },
+      { "digit": "2", "label": "Support", "action": { "type": "submenu", "menu": {
+          "prompt": "For a new issue, press 1. For an existing ticket, press 2. To go back, press 9.",
+          "options": [
+            { "digit": "1", "action": { "type": "transfer_to_queue", "queue": "Support" } },
+            { "digit": "2", "action": { "type": "transfer_to_queue", "queue": "Support_Escalations" } },
+            { "digit": "9", "action": { "type": "previous_menu" } }
+          ] } } },
+      { "digit": "3", "label": "Billing", "action": { "type": "transfer_to_queue", "queue": "Billing" } }
+    ],
+    "no_input": { "retries": 2, "message": "Sorry, I didn't catch that.", "then": { "type": "hangup" } }
+  }
+}
