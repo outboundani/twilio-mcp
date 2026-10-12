@@ -120,7 +120,7 @@ Ask it to point a number at the flow or start taking calls and it refuses, then 
   - New workspaces arrive seeded with Offline, Idle, Busy, and Reserved; `create_workspace` fills the gaps (Unavailable, Break) without adding a second ready state.
   - The Account resource carries an `auth_token` field (empty under API-key auth, redacted regardless). Two pagination dialects: `meta.next_page_url` (absolute) and `next_page_uri` (relative); the client follows both only on the pinned host.
 - **OAuth 2.1 built in** (dynamic client registration, PKCE, stateless HMAC-signed tokens), so it plugs straight into Claude and ChatGPT as a connector.
-- Tested against a live Twilio account: 45 unit tests (`npm test`) plus a 38-step live smoke suite (`npm run smoke`, read-only by default; `-- --writes` builds an `MCP_Test_` workspace, four queues, a workflow, and a draft flow from the example spec, then proves the round trip on what Twilio stored). No calls, no numbers, no trial credit spent.
+- Tested against a live Twilio account: 97 unit tests (`npm test`) plus a 38-step live smoke suite (`npm run smoke`, read-only by default; `-- --writes` builds an `MCP_Test_` workspace, four queues, a workflow, and a draft flow from the example spec, then proves the round trip on what Twilio stored). No calls, no numbers, no trial credit spent.
 
 ## Scoping the API key
 

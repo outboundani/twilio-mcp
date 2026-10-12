@@ -10,5 +10,11 @@
     "test": "node --test",
     "smoke": "node scripts/live-smoke.mjs"
   },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "wrangler": "4.143.0"
+  },
   "license": "MIT"
 }
