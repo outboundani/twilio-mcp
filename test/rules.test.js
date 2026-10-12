@@ -206,3 +206,14 @@ test('validateArgs enforces the advisory MCP schemas', () => {
   assert.ok(e.some((x) => x.includes('one of')));
   assert.ok(e.some((x) => x.includes('not a known argument')));
 });
+
+test('F1: a POST never carries a query string (second, unchecked parameter channel)', () => {
+  refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}`, query: { Status: 'published' }, body: { Status: 'draft', Definition: minimalDef } }, /never in `query`/);
+  refused({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { EventCallbackUrl: 'https://evil.example/hook' }, body: { FriendlyName: 'x' } }, /never in `query`/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, query: { Anything: 1 } }, /never in `query`/);
+  // Empty query values and empty objects are not a channel.
+  allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: {}, body: { FriendlyName: 'x' } });
+  allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { Blank: '' }, body: { FriendlyName: 'x' } });
+  // Reads keep their query.
+  assert.deepEqual(allowed({ host: 'studio', method: 'GET', path: 'v2/Flows', query: { PageSize: 5 } }).query, { PageSize: '5' });
+});

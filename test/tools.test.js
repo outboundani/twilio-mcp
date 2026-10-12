@@ -229,3 +229,23 @@ test('registry: every tool is grouped once, writes are flagged, no delete/call/s
   for (const w of WRITE_TOOLS) assert.ok(names.includes(w), w);
   assert.ok(!names.some((n) => /delete|remove|release|purchase|buy|call_number|dial|send|execute|repoint|publish_flow/.test(n)), names.join(','));
 });
+
+test('F1: the HTTP client attaches a query to GET only, never to a POST', async () => {
+  const calls = stub({
+    'GET studio.twilio.com/v2/Flows': () => ({ flows: [], meta: {} }),
+    'POST taskrouter.twilio.com/v1/Workspaces': () => ({ sid: WS, friendly_name: 'x' }),
+  });
+  const tw = new TwilioClient(cfg);
+  await tw.request('studio', 'GET', 'v2/Flows', { query: { PageSize: 5 } });
+  await tw.request('taskrouter', 'POST', 'v1/Workspaces', { form: { FriendlyName: 'x' }, query: { EventCallbackUrl: 'https://evil.example' } });
+  assert.deepEqual(calls[0].query, { PageSize: '5' });
+  assert.deepEqual(calls[1].query, {});
+  assert.equal(calls[1].form.FriendlyName, 'x');
+});
+
+test('F1: the raw tool refuses a POST with a query before any network call', async () => {
+  const calls = stub();
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'studio', method: 'POST', path: `v2/Flows/${FW}`, query: { Status: 'published' }, body: { Status: 'draft' } }), /^Error: Refused|Refused/);
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { EventCallbackUrl: 'https://evil.example' }, body: { FriendlyName: 'x' } }), /Refused/);
+  assert.equal(calls.length, 0);
+});

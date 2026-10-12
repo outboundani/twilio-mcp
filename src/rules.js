@@ -241,6 +241,12 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
     if (v === undefined || v === null || v === '') continue;
     sendQuery[k] = String(v);
   }
+  // Every allowed write takes its parameters in the form body. A query string
+  // on a POST is a second, unchecked channel (Twilio merges it with the body,
+  // so ?Status=published or ?EventCallbackUrl=... would bypass the body rules).
+  if (m === 'POST' && Object.keys(sendQuery).length) {
+    return refuse(`Refused: POST calls take their parameters in \`body\`, never in \`query\` (got ${Object.keys(sendQuery).join(', ')}). A query string would skip the body checks.`);
+  }
 
   // Body: form parameters. Objects only, never on GET.
   if (body !== undefined && body !== null) {

@@ -60,8 +60,12 @@ export class TwilioClient {
       if (url.pathname !== expected || url.search || url.hash || url.host !== HOSTS[hostKey]) {
         throw new TwilioError(`Refused: the path "${rel}" does not survive URL parsing unchanged.`, 400);
       }
-      for (const [k, v] of Object.entries(query || {})) {
-        if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+      // Query strings are for reads only. Writes carry their parameters in
+      // the form body, which is what the write rules inspect.
+      if (m === 'GET') {
+        for (const [k, v] of Object.entries(query || {})) {
+          if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+        }
       }
     }
     const headers = { Authorization: this.auth, Accept: 'application/json' };
