@@ -120,11 +120,24 @@ Ask it to point a number at the flow or start taking calls and it refuses, then 
   - New workspaces arrive seeded with Offline, Idle, Busy, and Reserved; `create_workspace` fills the gaps (Unavailable, Break) without adding a second ready state.
   - The Account resource carries an `auth_token` field (empty under API-key auth, redacted regardless). Two pagination dialects: `meta.next_page_url` (absolute) and `next_page_uri` (relative); the client follows both only on the pinned host.
 - **OAuth 2.1 built in** (dynamic client registration, PKCE, stateless HMAC-signed tokens), so it plugs straight into Claude and ChatGPT as a connector.
-- Tested against a live Twilio account: 45 unit tests (`npm test`) plus a 38-step live smoke suite (`npm run smoke`, read-only by default; `-- --writes` builds an `MCP_Test_` workspace, four queues, a workflow, and a draft flow from the example spec, then proves the round trip on what Twilio stored). No calls, no numbers, no trial credit spent.
+- Tested against a live Twilio account: 97 unit tests (`npm test`) plus a 38-step live smoke suite (`npm run smoke`, read-only by default; `-- --writes` builds an `MCP_Test_` workspace, four queues, a workflow, and a draft flow from the example spec, then proves the round trip on what Twilio stored). No calls, no numbers, no trial credit spent.
 
 ## Scoping the API key
 
 A Standard API key can do anything the account can. That is exactly why the rails live in this Worker's code rather than in a prompt. If your account offers restricted API keys, grant only Studio and TaskRouter plus read access to phone numbers. For extra distance, run it against a subaccount that owns only the contact center, and rotate the key whenever it has been pasted anywhere.
+
+## Security configuration
+
+Optional Worker variables (set with `npx wrangler secret put` or as plain vars):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MCP_ALLOWED_ORIGINS` | claude.ai, chatgpt.com, this server, localhost | Comma separated browser origins allowed to call `/mcp`. Requests with no `Origin` (server-side connectors, SDKs, curl) are always fine. `*` turns the check off. |
+| `OAUTH_EXTRA_REDIRECT_SCHEMES` | none | Comma separated custom URI schemes (for example `cursor,vscode`) accepted as OAuth redirect URIs. `https` and loopback `http` are always accepted; `javascript:` and `data:` never are. |
+
+OAuth tokens: access tokens last 1 hour, refresh tokens 30 days (rotated on every refresh, capped at 90 days from consent), auth codes 5 minutes. Tokens are bound to this server's `/mcp` URL and to the client that obtained them, and are signed with a key derived (HKDF) from `MCP_AUTH_TOKEN`. Stateless limits: auth codes are not single use and an old refresh token cannot be revoked individually. To revoke every outstanding token, rotate `MCP_AUTH_TOKEN`.
+
+Reading Studio Executions returns status only: the caller's number and the flow context are withheld, and the Steps and Context sub-resources are not readable. Raw-written Studio flows may not reference remote URLs (for example a `play` audio file) unless the host is listed in `ALLOWED_URL_HOSTS` in `src/rules.js` (empty by default). Updating an existing task queue or workflow through `twilio_api_call` needs `confirm_live_update: true`.
 
 ## License
 

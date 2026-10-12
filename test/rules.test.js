@@ -3,7 +3,7 @@
 // a blocklist guard, re-aimed at Twilio. They must all stay refused.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems } from '../src/rules.js';
+import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems, findDuplicateKeys, canonicalJson, scrubReadResponse, redactText, ALLOWED_URL_HOSTS } from '../src/rules.js';
 
 const AC = `AC${'1'.repeat(32)}`;
 const OTHER = `AC${'2'.repeat(32)}`;
@@ -64,7 +64,7 @@ test('never dials: calls, conferences, and Studio Executions (read or write, any
   refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}/executions` }, /places a real outbound call/);
   refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}/Executions/${FN}`, body: { Status: 'ended' } }, /places a real outbound call/);
   allowed({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions` });
-  allowed({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` });
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` }, /allowlist/); // caller PII, see F6
 });
 
 test('never sends: messages, SMS, conversations', () => {
@@ -157,8 +157,8 @@ test('TaskRouter build writes are allowed', () => {
   allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', body: { FriendlyName: 'MCP_Test_ws' } });
   allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Activities`, body: { FriendlyName: 'Break', Available: false } });
   allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues`, body: { FriendlyName: 'Sales', TargetWorkers: "skills HAS 'Sales'" } });
-  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues/${WQ}`, body: { MaxReservedWorkers: 2 } });
-  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows/${WW}`, body: { TaskReservationTimeout: 60 } });
+  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues/${WQ}`, body: { MaxReservedWorkers: 2 }, confirm_live_update: true });
+  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows/${WW}`, body: { TaskReservationTimeout: 60 }, confirm_live_update: true });
 });
 
 test('SID placeholders are strict: wrong prefix or length never matches a template', () => {
@@ -205,4 +205,117 @@ test('validateArgs enforces the advisory MCP schemas', () => {
   assert.ok(e.some((x) => x.includes('>= 1')));
   assert.ok(e.some((x) => x.includes('one of')));
   assert.ok(e.some((x) => x.includes('not a known argument')));
+});
+
+test('F1: a POST never carries a query string (second, unchecked parameter channel)', () => {
+  refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}`, query: { Status: 'published' }, body: { Status: 'draft', Definition: minimalDef } }, /never in `query`/);
+  refused({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { EventCallbackUrl: 'https://evil.example/hook' }, body: { FriendlyName: 'x' } }, /never in `query`/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, query: { Anything: 1 } }, /never in `query`/);
+  // Empty query values and empty objects are not a channel.
+  allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: {}, body: { FriendlyName: 'x' } });
+  allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { Blank: '' }, body: { FriendlyName: 'x' } });
+  // Reads keep their query.
+  assert.deepEqual(allowed({ host: 'studio', method: 'GET', path: 'v2/Flows', query: { PageSize: 5 } }).query, { PageSize: '5' });
+});
+
+test('F5: findDuplicateKeys sees duplicates JSON.parse hides, including escaped and nested ones', () => {
+  assert.deepEqual(findDuplicateKeys('{"a":1,"b":2}'), []);
+  assert.deepEqual(findDuplicateKeys('{"a":1,"a":2}'), ['a']);
+  assert.deepEqual(findDuplicateKeys('{"a":1,"\\u0061":2}'), ['a']);
+  assert.deepEqual(findDuplicateKeys('{"o":{"k":1,"k":2}}'), ['k']);
+  assert.deepEqual(findDuplicateKeys('{"l":[{"x":1},{"x":2}]}'), [], 'the same key in sibling objects is fine');
+  assert.deepEqual(findDuplicateKeys('[{"x":1,"x":2}]'), ['x']);
+  assert.deepEqual(findDuplicateKeys('{"s":"a\\"b","t":"{\\"z\\":1,\\"z\\":2}"}'), [], 'quotes and braces inside strings are not structure');
+  assert.deepEqual(findDuplicateKeys('{"n":-1.5e3,"t":true,"f":false,"z":null,"a":[1,2,3]}'), []);
+  assert.throws(() => findDuplicateKeys('['.repeat(200) + ']'.repeat(200)), /too deeply/);
+});
+
+test('F5: string Definition and Configuration are re-serialized, never forwarded as written', () => {
+  const raw = '{ "states" : [ { "name":"Trigger", "type":"trigger", "properties":{}, "transitions":[] } ],\n  "initial_state" : "Trigger" }';
+  const r = allowed({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: raw } });
+  assert.equal(r.form.Definition, JSON.stringify(JSON.parse(raw)));
+  assert.ok(!r.form.Definition.includes(' '), 'no caller whitespace survives');
+  const cfgRaw = '{ "task_routing" : { "filters" : [ ] } }';
+  const w = allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: cfgRaw } });
+  assert.equal(w.form.Configuration, '{"task_routing":{"filters":[]}}');
+  // Objects still work and produce the same canonical bytes.
+  const o = allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: JSON.parse(cfgRaw) } });
+  assert.equal(o.form.Configuration, w.form.Configuration);
+});
+
+test('F5: duplicate keys in a JSON string field are refused (parser-differential smuggling)', () => {
+  const bad = '{"states":[{"name":"Trigger","type":"trigger","properties":{},"transitions":[]}],"initial_state":"Trigger","initial_state":"Elsewhere"}';
+  refused({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: bad } }, /repeats the key\(s\) "initial_state"/);
+  // The classic: a harmless first widget list, a dangerous second one that a first-wins parser would use.
+  const swap = '{"states":[{"name":"t","type":"trigger","properties":{},"transitions":[]}],"states":[{"name":"d","type":"make-outgoing-call-v2","properties":{},"transitions":[]}]}';
+  refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}`, body: { Status: 'draft', Definition: swap } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{"task_routing":{},"task_routing":{"filters":[]}}' } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{"a":{"b":1,"\\u0062":2}}' } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{not json' } }, /not valid JSON/);
+  assert.equal(canonicalJson('{"a":1}').value, '{"a":1}');
+  assert.equal(canonicalJson('{"a":1,"a":2}').ok, false);
+});
+
+test('F6: Execution Steps and Context (caller PII) are not readable through the raw tool', () => {
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` }, /allowlist/);
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Context` }, /allowlist/);
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps/FT${'0'.repeat(32)}` }, /allowlist/);
+  // Execution rows themselves stay readable, minus caller fields.
+  const row = { sid: FN, status: 'ended', contact_channel_address: '+15555550123', context: { trigger: { call: { From: '+15555550123' } } }, contact_sid: 'FC1', nested: [{ context: 'x', ok: 1 }] };
+  const out = scrubReadResponse(`v2/Flows/${FW}/Executions`, { executions: [row] });
+  assert.equal(out.executions[0].status, 'ended');
+  assert.equal(out.executions[0].contact_channel_address, '[withheld: caller data]');
+  assert.equal(out.executions[0].context, '[withheld: caller data]');
+  assert.equal(out.executions[0].nested[0].context, '[withheld: caller data]');
+  assert.equal(out.executions[0].nested[0].ok, 1);
+  // Other resources are untouched.
+  assert.deepEqual(scrubReadResponse('v2/Flows', { context: 'keep' }), { context: 'keep' });
+});
+
+test('F6: redaction covers key names, value shapes, and exact known secrets', () => {
+  const r = redactSecrets({
+    access_token: 'abc', refresh_token: 'abc', Authorization: 'Bearer abcdef123456', bearer: 'x', apiKey: 'k', client_secret: 's',
+    set_vars: { key: 'greeting', value: 'hello' }, friendly_name: 'ok',
+  });
+  for (const k of ['access_token', 'refresh_token', 'Authorization', 'bearer', 'apiKey', 'client_secret']) assert.equal(r[k], '[redacted]', k);
+  assert.deepEqual(r.set_vars, { key: 'greeting', value: 'hello' }, 'a bare "key" field is not a secret (Studio set-variables)');
+  assert.equal(r.friendly_name, 'ok');
+  // Shapes inside strings, including a JSON document stored as a string.
+  assert.equal(redactSecrets('Authorization: Bearer abcdef123456 trailing'), 'Authorization: Bearer [redacted] trailing');
+  assert.equal(redactSecrets('curl -H "Authorization: Bearer abcdef123456"'), 'curl -H "Authorization: Bearer [redacted]"');
+  assert.equal(redactSecrets('token=abcd1234&x=1'), 'token=[redacted]&x=1');
+  assert.equal(redactSecrets('password: hunter2'), 'password: [redacted]');
+  assert.equal(redactSecrets('https://x.example/p?sig=abcdef&y=1'), 'https://x.example/p?sig=[redacted]&y=1');
+  assert.equal(redactSecrets('{"api_key":"abcd1234","n":1}'), '{"api_key":"[redacted]","n":1}');
+  assert.equal(redactSecrets('sent Bearer abc123def now'), 'sent Bearer [redacted] now');
+  // Exact known values are scrubbed anywhere, even without a telltale key.
+  assert.equal(redactSecrets({ note: 'the value is S3cr3tValue9 ok' }, { known: ['S3cr3tValue9'] }).note, 'the value is [redacted] ok');
+  assert.equal(redactSecrets({ note: 'ab' }, { known: ['ab'] }).note, 'ab', 'tiny values are not treated as secrets (would shred text)');
+  // Ordinary data is untouched.
+  assert.deepEqual(redactSecrets({ sid: AC, n: 3, ok: true, nil: null, list: ['a', 'b'] }), { sid: AC, n: 3, ok: true, nil: null, list: ['a', 'b'] });
+  assert.equal(redactText('no secrets here: 12345'), 'no secrets here: 12345');
+});
+
+test('F6: Studio definitions are walked recursively; URL-valued properties are refused unless allowlisted', () => {
+  const widget = (properties) => ({ states: [{ name: 'w', type: 'say-play', properties, transitions: [] }] });
+  // Top-level play URL.
+  assert.equal(definitionProblems(widget({ play: 'https://evil.example/hold.mp3' })).length, 1);
+  assert.equal(definitionProblems(widget({ play: '//evil.example/hold.mp3' })).length, 1);
+  // Deeply nested URL-named key and URL value.
+  assert.equal(definitionProblems(widget({ outer: { inner: [{ deep_url: 'x' }] } })).length, 1);
+  assert.equal(definitionProblems(widget({ outer: { inner: [{ media: 'https://evil.example/a.wav' }] } })).length, 1);
+  assert.equal(definitionProblems(widget({ variables: [{ key: 'cb', value: 'https://evil.example/x' }] })).length, 1);
+  // Plain text, including text that merely mentions a URL, is fine.
+  assert.deepEqual(definitionProblems(widget({ say: 'Visit example dot com', language: 'en-US', loop: 1 })), []);
+  assert.deepEqual(definitionProblems(widget({ say: 'see https://example.com for details' })), []);
+  // Explicit allowlist: exact host and wildcard subdomain; the *_url key rule is NOT overridable.
+  const allow = { allowedUrlHosts: ['media.example.org', '*.cdn.example.net'] };
+  assert.deepEqual(definitionProblems(widget({ play: 'https://media.example.org/a.mp3' }), allow), []);
+  assert.deepEqual(definitionProblems(widget({ play: 'https://a.cdn.example.net/a.mp3' }), allow), []);
+  assert.equal(definitionProblems(widget({ play: 'https://cdn.example.net/a.mp3' }), allow).length, 1, 'wildcard needs a real subdomain');
+  assert.equal(definitionProblems(widget({ play: 'https://media.example.org.evil.com/a.mp3' }), allow).length, 1, 'lookalike host');
+  assert.equal(definitionProblems(widget({ wait_url: 'https://media.example.org/a.mp3' }), allow).length, 1, '*_url keys stay refused');
+  assert.equal(ALLOWED_URL_HOSTS.length, 0, 'the default allowlist is empty');
+  // Through the raw tool.
+  refused({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: widget({ play: 'https://evil.example/hold.mp3' }) } }, /URL value at play/);
 });

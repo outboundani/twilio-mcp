@@ -63,10 +63,12 @@ const READS = [
   T('studio', 'v2/Flows/{FW}'),
   T('studio', 'v2/Flows/{FW}/Revisions'),
   T('studio', 'v2/Flows/{FW}/Revisions/{REV}'),
+  // Executions are listed for status only. Their Context and Steps carry the
+  // caller's number and whatever the caller said or pressed (PII), so those two
+  // sub-resources are not readable, and the Execution rows themselves are
+  // scrubbed of caller fields (see scrubReadResponse).
   T('studio', 'v2/Flows/{FW}/Executions'),
   T('studio', 'v2/Flows/{FW}/Executions/{FN}'),
-  T('studio', 'v2/Flows/{FW}/Executions/{FN}/Steps'),
-  T('studio', 'v2/Flows/{FW}/Executions/{FN}/Context'),
   T('taskrouter', 'v1/Workspaces'),
   T('taskrouter', 'v1/Workspaces/{WS}'),
   T('taskrouter', 'v1/Workspaces/{WS}/Statistics'),
@@ -103,6 +105,24 @@ export const WRITES = [
 
 export const WRITE_FAMILIES = 'Studio flows (create, update as draft only, validate) and TaskRouter workspaces, activities, task queues, and workflows (create and update)';
 
+// Existing objects that are live the moment they change. See checkRawCall.
+const LIVE_UPDATE = ['v1/Workspaces/{WS}/TaskQueues/{WQ}', 'v1/Workspaces/{WS}/Workflows/{WW}'].map(R);
+
+// A short, safe description of a pending form for a refusal message. JSON
+// fields are summarized (size and top-level keys), long values are clipped.
+function describeChange(form) {
+  const parts = Object.entries(form).map(([k, v]) => {
+    if (isSecretKey(k)) return `${k}=[redacted]`;
+    if (JSON_FIELDS.includes(k.toLowerCase())) {
+      let keys = '';
+      try { const o = JSON.parse(v); keys = o && typeof o === 'object' ? ` with top-level keys ${Object.keys(o).join(', ') || '(none)'}` : ''; } catch { /* not JSON */ }
+      return `${k}=<JSON, ${v.length} chars${keys}>`;
+    }
+    return `${k}=${JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}...` : v)}`;
+  });
+  return parts.length ? parts.join(', ') : '(no fields)';
+}
+
 // Used by the HTTP client on EVERY non-GET request, typed tools included.
 export function isAllowedWrite(hostKey, method, path) {
   if (String(method).toUpperCase() !== 'POST') return false;
@@ -114,15 +134,50 @@ export function isAllowedWrite(hostKey, method, path) {
 
 const normKey = (k) => String(k).toLowerCase().replace(/[_-]/g, '');
 // The Account resource carries auth_token (empty under API-key auth, but
-// never trust that); keys and credentials resources carry secrets.
-const SECRET_KEY = /authtoken|secret|passw|credential|apikey|privatekey|signingkey/;
+// never trust that); keys and credentials resources carry secrets. A bare
+// "key" is NOT here on purpose: Studio set-variables widgets use { key, value }.
+const SECRET_KEY = /token|secret|passw|credential|apikey|privatekey|signingkey|accesskey|secretkey|authorization|bearer/;
 const isSecretKey = (k) => SECRET_KEY.test(normKey(k));
 
-export function redactSecrets(value) {
-  if (Array.isArray(value)) return value.map(redactSecrets);
+// Secret SHAPES inside free text (a string value, an error message, a JSON
+// document stored as a string): "Authorization: Bearer abc", "token=abc",
+// "password: abc", "?sig=abc", "api_key":"abc".
+const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]{6,}/gi;
+const KV_SECRET = /\b(authorization|auth[_-]?token|access[_-]?token|refresh[_-]?token|token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)(["']?\s*[:=]\s*["']?)(?!\[redacted\]|Bearer\s+\[redacted\])([^\s"',;&}]{4,})/gi;
+const URL_SECRET = /([?&](?:sig|signature|key|auth|code)=)([^&\s"']{4,})/gi;
+
+export function redactText(text, known = []) {
+  let s = String(text);
+  for (const k of known) if (typeof k === 'string' && k.length >= 8) s = s.split(k).join('[redacted]');
+  return s.replace(BEARER, 'Bearer [redacted]').replace(KV_SECRET, '$1$2[redacted]').replace(URL_SECRET, '$1[redacted]');
+}
+
+// Redacts by key name AND by value shape, recursively. `known` is a list of
+// exact secret values (the configured API key secret, the MCP access key)
+// that are scrubbed wherever they appear.
+export function redactSecrets(value, { known = [] } = {}, depth = 0) {
+  if (typeof value === 'string') return redactText(value, known);
+  if (Array.isArray(value)) return depth > 64 ? [] : value.map((v) => redactSecrets(v, { known }, depth + 1));
   if (!value || typeof value !== 'object') return value;
+  if (depth > 64) return {};
   const out = {};
-  for (const [k, v] of Object.entries(value)) out[k] = isSecretKey(k) && v !== null && v !== '' ? '[redacted]' : redactSecrets(v);
+  for (const [k, v] of Object.entries(value)) out[k] = isSecretKey(k) && v !== null && v !== '' ? '[redacted]' : redactSecrets(v, { known }, depth + 1);
+  return out;
+}
+
+// Fields on Studio Execution rows that identify or quote the caller.
+const EXECUTION_PII = new Set(['context', 'contact_channel_address', 'contact_sid']);
+
+// Applied to raw READ responses before they reach the model.
+export function scrubReadResponse(rel, value, depth = 0) {
+  if (!/(^|\/)Executions(\/|$)/.test(rel)) return value;
+  if (Array.isArray(value)) return value.map((v) => scrubReadResponse(rel, v, depth + 1));
+  if (!value || typeof value !== 'object' || depth > 16) return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (EXECUTION_PII.has(k.toLowerCase())) out[k] = '[withheld: caller data]';
+    else out[k] = scrubReadResponse(rel, v, depth + 1);
+  }
   return out;
 }
 
@@ -135,9 +190,41 @@ export function redactSecrets(value) {
 // no Flex handoff.
 export const SAFE_WIDGETS = new Set(['trigger', 'say-play', 'gather-input-on-call', 'split-based-on', 'set-variables', 'enqueue-call', 'record-voicemail']);
 
+// Hosts a raw-written flow may reference in a URL-VALUED property that is not
+// named *_url (say-play's `play` is the one that matters: an audio file the
+// flow fetches on every call). Empty by default: a flow written through the
+// raw tool plays text via `say`, not remote audio. To allow your own media
+// host, add its exact hostname here (or "*.example.com" for subdomains).
+// Properties NAMED *_url / *_uri / *callback* are always refused, allowlist or not.
+export const ALLOWED_URL_HOSTS = [];
+
+const URL_VALUE = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/\S+\s*$/i;
+function urlAllowed(value, allowed) {
+  let host;
+  try { host = new URL(value.trim().startsWith('//') ? `https:${value.trim()}` : value.trim()).hostname.toLowerCase(); } catch { return false; }
+  return allowed.some((h) => (h.startsWith('*.') ? host.endsWith(h.slice(1)) && host.length > h.length - 1 : host === h.toLowerCase()));
+}
+
+// Walks a widget's properties at ANY depth (set-variables, gather options,
+// nested objects and arrays), not just the top level.
+function propertyProblems(node, name, allowed, path, out, depth = 0) {
+  if (depth > MAX_DEPTH) { out.push(`widget "${name}" nests properties too deeply`); return; }
+  if (Array.isArray(node)) { node.forEach((x, i) => propertyProblems(x, name, allowed, `${path}[${i}]`, out, depth + 1)); return; }
+  if (typeof node === 'string') {
+    if (URL_VALUE.test(node) && !urlAllowed(node, allowed)) out.push(`widget "${name}" has a URL value at ${path} (remote URLs are not allowed unless the host is on ALLOWED_URL_HOSTS)`);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  for (const [k, v] of Object.entries(node)) {
+    if (/_?ur[li]$/i.test(k) || /callback/i.test(k)) out.push(`widget "${name}" sets ${path ? `${path}.` : ''}${k} (external URLs are not allowed)`);
+    propertyProblems(v, name, allowed, path ? `${path}.${k}` : k, out, depth + 1);
+  }
+}
+
 // Returns a list of problems (empty = fine). Also refuses any *_url
-// property (hold music, callbacks, recording webhooks): no egress.
-export function definitionProblems(definition) {
+// property (hold music, callbacks, recording webhooks) and any URL-valued
+// property (play) at any depth unless its host is allowlisted: no egress.
+export function definitionProblems(definition, { allowedUrlHosts = ALLOWED_URL_HOSTS } = {}) {
   let def = definition;
   if (typeof def === 'string') {
     try { def = JSON.parse(def); } catch { return ['Definition is not valid JSON.']; }
@@ -146,17 +233,99 @@ export function definitionProblems(definition) {
   const problems = [];
   for (const s of def.states) {
     if (!SAFE_WIDGETS.has(s?.type)) problems.push(`widget "${s?.name}" has type "${s?.type}", which is outside this server's allowed set (${[...SAFE_WIDGETS].join(', ')})`);
-    for (const k of Object.keys(s?.properties || {})) {
-      if (/_?ur[li]$/i.test(k) || /callback/i.test(k)) problems.push(`widget "${s?.name}" sets ${k} (external URLs are not allowed)`);
-    }
+    propertyProblems(s?.properties, s?.name, allowedUrlHosts, '', problems);
   }
   return problems;
+}
+
+// ---------- JSON canonicalization ----------
+
+// JSON.parse silently keeps the LAST duplicate key, but other parsers (and
+// Twilio's own) may keep the first. {"status":"draft","status":"published"}
+// is therefore ambiguous, and the checks in this file would only ever see one
+// of the two. This scanner reads the raw text of an ALREADY VALID JSON string
+// and returns every key that appears twice in the same object (keys are
+// compared after unescaping, so "a" and "\u0061" count as the same key).
+export function findDuplicateKeys(text) {
+  const dups = new Set();
+  const n = text.length;
+  let i = 0;
+  const ESC = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', '"': '"', '\\': '\\', '/': '/' };
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  const skipWs = () => { while (i < n && isWs(text[i])) i++; };
+  const readString = () => {
+    let out = '';
+    i++; // opening quote
+    while (i < n) {
+      const c = text[i];
+      if (c === '"') { i++; return out; }
+      if (c === '\\') {
+        const e = text[i + 1];
+        if (e === 'u') { out += String.fromCharCode(parseInt(text.slice(i + 2, i + 6), 16)); i += 6; } else { out += ESC[e] ?? e; i += 2; }
+      } else { out += c; i++; }
+    }
+    return out;
+  };
+  const readValue = (depth) => {
+    if (depth > MAX_DEPTH_JSON) throw new Error('JSON nests too deeply.');
+    skipWs();
+    const c = text[i];
+    if (c === '{') {
+      i++;
+      const seen = new Set();
+      skipWs();
+      if (text[i] === '}') { i++; return; }
+      for (;;) {
+        skipWs();
+        const k = readString();
+        if (seen.has(k)) dups.add(k);
+        seen.add(k);
+        skipWs(); i++; // colon
+        readValue(depth + 1);
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        i++; // closing brace
+        return;
+      }
+    } else if (c === '[') {
+      i++;
+      skipWs();
+      if (text[i] === ']') { i++; return; }
+      for (;;) {
+        readValue(depth + 1);
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        i++; // closing bracket
+        return;
+      }
+    } else if (c === '"') {
+      readString();
+    } else {
+      while (i < n && text[i] !== ',' && text[i] !== ']' && text[i] !== '}' && !isWs(text[i])) i++;
+    }
+  };
+  readValue(0);
+  return [...dups];
+}
+const MAX_DEPTH_JSON = 64;
+
+// A caller-supplied JSON string is never forwarded as written. It is parsed,
+// checked for duplicate keys, and re-serialized, so the bytes Twilio receives
+// are exactly the structure the checks above inspected.
+export function canonicalJson(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return { ok: false, message: 'is not valid JSON' }; }
+  let dups;
+  try { dups = findDuplicateKeys(text); } catch { return { ok: false, message: 'nests too deeply' }; }
+  if (dups.length) return { ok: false, message: `repeats the key(s) ${dups.map((k) => JSON.stringify(k)).join(', ')} (ambiguous: parsers disagree on which one wins)` };
+  return { ok: true, value: JSON.stringify(parsed) };
 }
 
 // ---------- the raw-API guard ----------
 
 const refuse = (message) => ({ ok: false, message });
 const MAX_DEPTH = 32;
+const JSON_FIELDS = ['definition', 'configuration', 'attributes'];
 
 function hasCaseDuplicateKeys(obj, depth = 0) {
   if (!obj || typeof obj !== 'object' || depth > MAX_DEPTH) return false;
@@ -201,7 +370,7 @@ function familyRefusal(hostKey, m, segs) {
 // with the exact values to send, or { ok: false, message }. Nothing is sent
 // unless this says ok. `accountSid` binds api.twilio.com paths to the
 // configured account (no wandering into subaccounts or other accounts).
-export function checkRawCall({ host, method, path, query, body } = {}, { accountSid } = {}) {
+export function checkRawCall({ host, method, path, query, body, confirm_live_update: confirmLive } = {}, { accountSid } = {}) {
   const m = String(method ?? '').toUpperCase();
   if (m === 'DELETE') return refuse('Refused: this server ships no deletes, and the raw tool refuses DELETE by design.');
   if (!['GET', 'POST'].includes(m)) return refuse(`Refused: method ${m || '(none)'} is not allowed. Twilio uses GET to read and POST to create or update.`);
@@ -241,6 +410,12 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
     if (v === undefined || v === null || v === '') continue;
     sendQuery[k] = String(v);
   }
+  // Every allowed write takes its parameters in the form body. A query string
+  // on a POST is a second, unchecked channel (Twilio merges it with the body,
+  // so ?Status=published or ?EventCallbackUrl=... would bypass the body rules).
+  if (m === 'POST' && Object.keys(sendQuery).length) {
+    return refuse(`Refused: POST calls take their parameters in \`body\`, never in \`query\` (got ${Object.keys(sendQuery).join(', ')}). A query string would skip the body checks.`);
+  }
 
   // Body: form parameters. Objects only, never on GET.
   if (body !== undefined && body !== null) {
@@ -254,9 +429,15 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
     if (!/^[A-Za-z][A-Za-z0-9_.]*$/.test(k)) return refuse(`Refused: form parameter "${k}" is not a plain identifier.`);
     if (/ur[li]$|callback/i.test(k)) return refuse(`Refused: ${k} would point Twilio at an external URL (webhook egress). Not allowed through the raw tool.`);
     if (v === undefined || v === null) continue;
+    const isJsonField = JSON_FIELDS.includes(k.toLowerCase());
     if (typeof v === 'object') {
-      if (!['definition', 'configuration', 'attributes'].includes(k.toLowerCase())) return refuse(`Refused: form parameter ${k} must be a scalar (only Definition, Configuration, and Attributes may be JSON objects).`);
+      if (!isJsonField) return refuse(`Refused: form parameter ${k} must be a scalar (only Definition, Configuration, and Attributes may be JSON objects).`);
       form[k] = JSON.stringify(v);
+    } else if (isJsonField && typeof v === 'string') {
+      // Canonical form only: the caller's raw string is never forwarded.
+      const c = canonicalJson(v);
+      if (!c.ok) return refuse(`Refused: ${k} ${c.message}.`);
+      form[k] = c.value;
     } else {
       form[k] = String(v);
     }
@@ -266,6 +447,15 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
   const table = m === 'GET' ? READS : WRITES;
   if (!table.some(([h, r]) => h === hostKey && r.test(rel))) {
     return refuse(`Refused: ${m} ${HOSTS[hostKey]}/${rel} is not on the raw tool's allowlist. Reads cover the account, phone numbers (read only), TwiML apps, Studio flows and their revisions/executions, and TaskRouter configuration. Writes are limited to ${WRITE_FAMILIES}. Deletes, calls, messages, numbers, executions, tasks, workers, and credentials are out of scope.`);
+  }
+
+  // Updating an EXISTING task queue or workflow edits live routing: the
+  // change applies to calls in flight the moment Twilio accepts it. Creates
+  // (POST to the collection) are not live until something routes to them, so
+  // only updates need the explicit flag. The refusal says what would change.
+  if (m === 'POST' && hostKey === 'taskrouter' && LIVE_UPDATE.some((r) => r.test(rel)) && confirmLive !== true) {
+    const kind = /\/TaskQueues\//.test(rel) ? 'task queue' : 'workflow';
+    return refuse(`Refused: POST ${rel} would UPDATE a live ${kind}, and the change applies to calls in flight immediately. It would set: ${describeChange(form)}. Show the user exactly this change, and only after they approve it re-send the same call with confirm_live_update: true. (Nothing was sent.)`);
   }
 
   // Studio write rules.

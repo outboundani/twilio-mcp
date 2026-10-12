@@ -30,6 +30,9 @@ function formBody(params) {
   return f;
 }
 
+const MAX_PAGES = 25;
+const REQUEST_TIMEOUT_MS = 15000;
+
 export class TwilioClient {
   constructor({ accountSid, apiKeySid, apiKeySecret }) {
     this.accountSid = accountSid;
@@ -60,8 +63,12 @@ export class TwilioClient {
       if (url.pathname !== expected || url.search || url.hash || url.host !== HOSTS[hostKey]) {
         throw new TwilioError(`Refused: the path "${rel}" does not survive URL parsing unchanged.`, 400);
       }
-      for (const [k, v] of Object.entries(query || {})) {
-        if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+      // Query strings are for reads only. Writes carry their parameters in
+      // the form body, which is what the write rules inspect.
+      if (m === 'GET') {
+        for (const [k, v] of Object.entries(query || {})) {
+          if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+        }
       }
     }
     const headers = { Authorization: this.auth, Accept: 'application/json' };
@@ -70,7 +77,16 @@ export class TwilioClient {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       body = formBody(form).toString();
     }
-    const res = await fetch(url, { method: m, headers, body });
+    // No redirects (a redirect would carry the Authorization header to
+    // wherever it points) and a hard timeout so a stalled upstream cannot
+    // hang the Worker.
+    let res;
+    try {
+      res = await fetch(url, { method: m, headers, body, redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    } catch (e) {
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`, 504);
+      throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} could not be completed (network error or an unexpected redirect, which this server refuses to follow).`, 502);
+    }
     if (res.status === 429 && _attempt < 2) {
       const ra = Number(res.headers.get('Retry-After'));
       await new Promise((r) => setTimeout(r, Number.isFinite(ra) && ra > 0 ? Math.min(ra, 10) * 1000 : (_attempt === 0 ? 1500 : 5000)));
@@ -78,9 +94,17 @@ export class TwilioClient {
     }
     if (res.status === 204) return { ok: true };
     const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : { ok: true }; } catch { data = { raw: text.slice(0, 500) }; }
+    let data = null;
+    try { data = text ? JSON.parse(text) : { ok: true }; } catch { /* handled below */ }
+    const isObject = data !== null && typeof data === 'object' && !Array.isArray(data);
+    if (res.ok && !isObject) {
+      // A 2xx that is not a JSON object (an HTML error page from a proxy, a
+      // captive portal, a truncated body) is NOT success. Callers act on what
+      // they read here, so fail instead of guessing.
+      throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} returned HTTP ${res.status} with a body that is not a JSON object. Refusing to treat it as success.`, 502);
+    }
     if (!res.ok) {
+      data = isObject ? data : {};
       const msg = data.message || data.detail || `HTTP ${res.status}`;
       const more = data.more_info ? ` (${data.more_info})` : '';
       const code = data.code ? ` [${data.code}]` : '';
@@ -100,15 +124,21 @@ export class TwilioClient {
   // only when they stay on the same pinned host. Caps at `max`.
   async listAll(hostKey, path, key, query = {}, { max = 500 } = {}) {
     const out = [];
+    let truncated = false;
     let page = await this.get(hostKey, path, { PageSize: Math.min(max, 200), ...query });
-    for (;;) {
+    for (let pages = 1; ; pages++) {
       out.push(...(page[key] || []));
       const next = page.meta?.next_page_url || (page.next_page_uri ? `https://${HOSTS[hostKey]}${page.next_page_uri}` : null);
-      if (!next || out.length >= max) break;
-      const u = new URL(next);
-      if (u.host !== HOSTS[hostKey] || u.protocol !== 'https:') break;
+      if (!next) break;
+      // There IS more data. Stopping now (cap reached, a link we refuse to
+      // follow, or a runaway pager) means the list is incomplete, and callers
+      // that decide "this name is free" or "nothing points here" must know.
+      if (out.length >= max || pages >= MAX_PAGES) { truncated = true; break; }
+      let u;
+      try { u = new URL(next); } catch { truncated = true; break; }
+      if (u.host !== HOSTS[hostKey] || u.protocol !== 'https:') { truncated = true; break; }
       page = await this.request(hostKey, 'GET', u.pathname, { _url: u });
     }
-    return { entities: out.slice(0, max), truncated: out.length > max };
+    return { entities: out.slice(0, max), truncated: truncated || out.length > max };
   }
 }

@@ -14,7 +14,7 @@
 
 import { TwilioClient, TwilioError } from './twilio.js';
 import { ABOUT } from './about.js';
-import { checkRawCall, redactSecrets, validateArgs, isSid } from './rules.js';
+import { checkRawCall, redactSecrets, scrubReadResponse, definitionProblems, validateArgs, isSid } from './rules.js';
 import {
   validateSpec, normalizeSpec, specToFlow, flowToSpec, specToMermaid, definitionToMermaid,
   specQueues, QUEUE_ATTR, NORMALIZATIONS, HOURS_GAP,
@@ -23,11 +23,26 @@ import {
 // ---------- shared helpers ----------
 
 const NAME_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
+// Per-call cap on objects one tool call may create (queues via
+// create_missing_queues, activities, workflow routes). A runaway or prompt-
+// injected spec cannot mint hundreds of objects in one go.
+export const MAX_BULK_CREATE = 25;
 const lc = (s) => String(s ?? '').toLowerCase();
 const parseJson = (s, fallback = {}) => { try { return typeof s === 'string' ? JSON.parse(s) : (s ?? fallback); } catch { return fallback; } };
 
-function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint }) {
+// Resolves a reference (SID, name, or nothing) against a list.
+//   exactOnly: WRITE paths. A SID or a case-insensitive EXACT name only. No
+//             substring fallback, so "Prod" can never quietly mean
+//             "Production_Contact_Center".
+//   explicit: the reference may not be omitted, even when only one object
+//             exists. Used for existing objects a write wires into (no
+//             implicit "the only workflow" default).
+// Reads keep the forgiving behavior (substring match, single-object default).
+function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint, exactOnly = false, explicit = false }) {
   if (ref === undefined || ref === null || ref === '') {
+    if (explicit) {
+      throw new TwilioError(`This is a write: name the ${what} explicitly (SID or exact name)${list.length ? `. Options: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}` : ''}. ${hint || ''}`.trim(), 409);
+    }
     if (list.length === 1) return list[0];
     if (!list.length) throw new TwilioError(`No ${what} exists yet.${hint ? ` ${hint}` : ''}`, 404);
     throw new TwilioError(`There are ${list.length} ${what}s - say which one: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}.`, 409);
@@ -40,22 +55,36 @@ function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint }) {
   const exact = list.filter((x) => lc(x[nameKey]) === lc(ref));
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) throw new TwilioError(`Ambiguous ${what} "${ref}" - use the SID: ${exact.map((x) => x.sid).join(', ')}.`, 409);
+  if (exactOnly) throw new TwilioError(`No ${what} named exactly "${ref}". Writes need a SID or the exact name (no partial matches).${list.length ? ` Options: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}.` : ''}`, 404);
   const wide = list.filter((x) => lc(x[nameKey]).includes(lc(ref)));
   if (wide.length === 1) return wide[0];
   if (wide.length > 1) throw new TwilioError(`Ambiguous ${what} "${ref}" - matches: ${wide.map((x) => x[nameKey]).join(', ')}.`, 409);
   throw new TwilioError(`No ${what} found matching "${ref}".`, 404);
 }
 
-const listWorkspaces = async (tw) => (await tw.listAll('taskrouter', 'v1/Workspaces', 'workspaces')).entities;
-const listQueues = async (tw, ws) => (await tw.listAll('taskrouter', `v1/Workspaces/${ws}/TaskQueues`, 'task_queues')).entities;
-const listWorkflows = async (tw, ws) => (await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Workflows`, 'workflows')).entities;
-const listActivities = async (tw, ws) => (await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Activities`, 'activities')).entities;
-const listWorkers = async (tw, ws) => (await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Workers`, 'workers')).entities;
-const listFlows = async (tw) => (await tw.listAll('studio', 'v2/Flows', 'flows')).entities;
-const listNumbers = async (tw) => (await tw.listAll('api', tw.acct('/IncomingPhoneNumbers.json'), 'incoming_phone_numbers')).entities;
+// Listing helpers. Every list carries a non-enumerable `truncated` flag (more
+// data existed than was fetched). Reads report it. Anything that decides "this
+// name is free", "no workflow routes this" or "no number points at this flow"
+// passes { strict: true }, which FAILS CLOSED on a truncated list instead of
+// deciding on partial data.
+function toRows(result, what, strict) {
+  if (strict && result.truncated) {
+    throw new TwilioError(`The list of ${what} is longer than this server can read in one pass, so it cannot safely tell whether a name is free or whether anything points at an object. Refusing to continue; do this one in the Twilio Console.`, 409);
+  }
+  Object.defineProperty(result.entities, 'truncated', { value: Boolean(result.truncated), enumerable: false });
+  return result.entities;
+}
+const listWorkspaces = async (tw, o) => toRows(await tw.listAll('taskrouter', 'v1/Workspaces', 'workspaces'), 'workspaces', o?.strict);
+const listQueues = async (tw, ws, o) => toRows(await tw.listAll('taskrouter', `v1/Workspaces/${ws}/TaskQueues`, 'task_queues'), 'task queues', o?.strict);
+const listWorkflows = async (tw, ws, o) => toRows(await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Workflows`, 'workflows'), 'workflows', o?.strict);
+const listActivities = async (tw, ws, o) => toRows(await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Activities`, 'activities'), 'activities', o?.strict);
+const listWorkers = async (tw, ws, o) => toRows(await tw.listAll('taskrouter', `v1/Workspaces/${ws}/Workers`, 'workers'), 'workers', o?.strict);
+const listFlows = async (tw, o) => toRows(await tw.listAll('studio', 'v2/Flows', 'flows'), 'Studio flows', o?.strict);
+const listNumbers = async (tw, o) => toRows(await tw.listAll('api', tw.acct('/IncomingPhoneNumbers.json'), 'incoming_phone_numbers'), 'phone numbers', o?.strict);
+const TRUNC_NOTE = 'This list was cut off (more entries exist than were read), so counts and "nothing points here" conclusions may be incomplete.';
 
-async function resolveWorkspace(tw, ref) {
-  return pick(await listWorkspaces(tw), ref, { sidPrefix: 'WS', what: 'workspace', hint: 'Create one with create_workspace.' });
+async function resolveWorkspace(tw, ref, { write = false } = {}) {
+  return pick(await listWorkspaces(tw, { strict: write }), ref, { sidPrefix: 'WS', what: 'workspace', hint: 'Create one with create_workspace.', exactOnly: write });
 }
 
 async function resolveFlow(tw, ref) {
@@ -140,7 +169,7 @@ async function createQueue(tw, ws, { name, target_workers, max_reserved_workers,
   };
   const workspace = await tw.get('taskrouter', `v1/Workspaces/${ws}`);
   if (!workspace.multi_task_enabled) {
-    const acts = await listActivities(tw, ws);
+    const acts = await listActivities(tw, ws, { strict: true });
     const find = (n) => acts.find((x) => lc(x.friendly_name) === n);
     const reserved = find('reserved');
     const busy = find('busy');
@@ -176,6 +205,7 @@ export const TOOLS = [
       return {
         ok: true, account: acct.friendly_name, account_sid: acct.sid, status: acct.status, type: acct.type,
         counts: { studio_flows: flows.length, taskrouter_workspaces: workspaces.length, phone_numbers: numbers.length },
+        note: [flows, workspaces, numbers].some((l) => l.truncated) ? TRUNC_NOTE : undefined,
       };
     },
   },
@@ -224,6 +254,7 @@ export const TOOLS = [
       }));
       if (!numbers.length) checks.push('This account has no phone numbers, so nothing here is reachable by callers. (Buying and pointing numbers is a human\'s job.)');
       else if (!flows.some((f) => f.live_on_numbers.length)) checks.push('No phone number points at any Studio flow: every flow here is built but not live.');
+      if ([workspaces, flowList, numbers].some((l) => l.truncated)) checks.push(TRUNC_NOTE);
       return { workspaces: wsOut, flows, phone_numbers: nums, checks };
     },
   },
@@ -238,6 +269,7 @@ export const TOOLS = [
       const flowNames = Object.fromEntries(flows.map((f) => [f.sid, f.friendly_name]));
       return {
         total: numbers.length,
+        truncated: numbers.truncated || flows.truncated || undefined,
         numbers: numbers.map((n) => ({
           sid: n.sid, number: n.phone_number, name: n.friendly_name,
           voice: describeTarget(n.voice_url, n.voice_application_sid, n.trunk_sid, flowNames),
@@ -336,7 +368,7 @@ export const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Workspace name, e.g. "Acme Contact Center"' },
         activities: {
-          type: 'array', description: 'Override the default activities',
+          type: 'array', maxItems: MAX_BULK_CREATE, description: 'Override the default activities (at most 25)',
           items: { type: 'object', properties: { name: { type: 'string' }, available: { type: 'boolean' } }, required: ['name', 'available'], additionalProperties: false },
         },
         multi_task_enabled: { type: 'boolean', description: 'Enable multitasking (voice plus digital channels per agent). Default false.' },
@@ -346,10 +378,10 @@ export const TOOLS = [
     },
     handler: async (tw, a) => {
       if (!NAME_RE.test(a.name)) throw new TwilioError('Workspace names may use letters, digits, space, _, ., - (64 max).', 400);
-      const existing = await listWorkspaces(tw);
+      const existing = await listWorkspaces(tw, { strict: true });
       if (existing.some((w) => lc(w.friendly_name) === lc(a.name))) throw new TwilioError(`A workspace named "${a.name}" already exists. This server creates, it does not overwrite: pick a new name.`, 409);
       const ws = await tw.post('taskrouter', 'v1/Workspaces', { FriendlyName: a.name, MultiTaskEnabled: a.multi_task_enabled ?? false });
-      const have = await listActivities(tw, ws.sid);
+      const have = await listActivities(tw, ws.sid, { strict: true });
       const wanted = a.activities?.length ? a.activities : DEFAULT_ACTIVITIES;
       const created = [];
       for (const act of wanted) {
@@ -386,8 +418,8 @@ export const TOOLS = [
     },
     handler: async (tw, a) => {
       if (!NAME_RE.test(a.name)) throw new TwilioError('Queue names may use letters, digits, space, _, ., - (64 max).', 400);
-      const ws = await resolveWorkspace(tw, a.workspace);
-      const qs = await listQueues(tw, ws.sid);
+      const ws = await resolveWorkspace(tw, a.workspace, { write: true });
+      const qs = await listQueues(tw, ws.sid, { strict: true });
       if (qs.some((q) => lc(q.friendly_name) === lc(a.name))) throw new TwilioError(`Queue "${a.name}" already exists in "${ws.friendly_name}".`, 409);
       const q = await createQueue(tw, ws.sid, a);
       return { created: true, workspace: ws.friendly_name, sid: q.sid, name: q.friendly_name, target_workers: q.target_workers, task_order: q.task_order };
@@ -401,7 +433,7 @@ export const TOOLS = [
       properties: {
         workspace: { type: 'string', description: 'Workspace name or SID (optional when there is exactly one)' },
         name: { type: 'string', description: 'Workflow name, e.g. "Main Line Routing"' },
-        queues: { type: 'array', items: { type: 'string' }, minItems: 1, description: 'Queue names to route to' },
+        queues: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: MAX_BULK_CREATE, description: 'Queue names to route to (at most 25)' },
         spec: { type: 'object', description: 'An IVR spec: route to every queue its transfer_to_queue actions name' },
         default_queue: { type: 'string', description: 'Queue for tasks that match no route (default: the first queue)' },
         create_missing_queues: { type: 'boolean', description: 'Create queues that do not exist yet (default false)' },
@@ -414,18 +446,22 @@ export const TOOLS = [
       if (!NAME_RE.test(a.name)) throw new TwilioError('Workflow names may use letters, digits, space, _, ., - (64 max).', 400);
       const names = a.queues?.length ? a.queues : (a.spec ? specQueues(a.spec) : []);
       if (!names.length) throw new TwilioError('Give queues (names) or an IVR spec with transfer_to_queue actions.', 400);
+      if (names.length > MAX_BULK_CREATE) throw new TwilioError(`A workflow call may route at most ${MAX_BULK_CREATE} queues (got ${names.length}). Split it up or build the rest in the Twilio Console.`, 400);
       const bad = names.filter((n) => !NAME_RE.test(n));
       if (bad.length) throw new TwilioError(`Queue names may use letters, digits, space, _, ., - only: ${bad.join(', ')}`, 400);
-      const ws = await resolveWorkspace(tw, a.workspace);
-      const wfs = await listWorkflows(tw, ws.sid);
+      const ws = await resolveWorkspace(tw, a.workspace, { write: true });
+      const wfs = await listWorkflows(tw, ws.sid, { strict: true });
       if (wfs.some((w) => lc(w.friendly_name) === lc(a.name))) throw new TwilioError(`Workflow "${a.name}" already exists in "${ws.friendly_name}".`, 409);
-      let qs = await listQueues(tw, ws.sid);
+      let qs = await listQueues(tw, ws.sid, { strict: true });
       const missing = names.filter((n) => !qs.some((q) => q.friendly_name === n));
       const createdQueues = [];
       if (missing.length) {
         if (!a.create_missing_queues) throw new TwilioError(`These queues do not exist in "${ws.friendly_name}" yet: ${missing.join(', ')}. Create them with create_task_queue, or pass create_missing_queues: true.`, 404);
+        if (missing.length > MAX_BULK_CREATE) throw new TwilioError(`create_missing_queues creates at most ${MAX_BULK_CREATE} queues per call (${missing.length} are missing). Nothing was created.`, 400);
+        const variants = missing.filter((n) => qs.some((q) => lc(q.friendly_name) === lc(n)));
+        if (variants.length) throw new TwilioError(`Queue(s) ${variants.join(', ')} already exist with different capitalization. Use the exact existing name; this server will not create a look-alike queue. Nothing was created.`, 409);
         for (const n of missing) createdQueues.push((await createQueue(tw, ws.sid, { name: n })).friendly_name);
-        qs = await listQueues(tw, ws.sid);
+        qs = await listQueues(tw, ws.sid, { strict: true });
       }
       const sidOf = (n) => qs.find((q) => q.friendly_name === n)?.sid;
       const def = a.default_queue || names[0];
@@ -458,6 +494,7 @@ export const TOOLS = [
       const rows = a.search ? flows.filter((f) => lc(f.friendly_name).includes(lc(a.search))) : flows;
       return {
         total: rows.length,
+        truncated: flows.truncated || numbers.truncated || undefined,
         flows: rows.map((f) => ({ sid: f.sid, name: f.friendly_name, status: f.status, revision: f.revision, updated: f.date_updated, live_on_numbers: numbersPointingAt(numbers, f.sid) })),
       };
     },
@@ -537,9 +574,9 @@ export const TOOLS = [
       const queues = specQueues(normalizeSpec(a.spec));
       let workflow = null;
       if (queues.length) {
-        const ws = await resolveWorkspace(tw, a.workspace);
-        const [wfs, qs] = await Promise.all([listWorkflows(tw, ws.sid), listQueues(tw, ws.sid)]);
-        const wf = pick(wfs, a.workflow, { sidPrefix: 'WW', what: 'workflow', hint: `Create one with create_workflow (pass this spec) in "${ws.friendly_name}".` });
+        const ws = await resolveWorkspace(tw, a.workspace, { write: true });
+        const [wfs, qs] = await Promise.all([listWorkflows(tw, ws.sid, { strict: true }), listQueues(tw, ws.sid, { strict: true })]);
+        const wf = pick(wfs, a.workflow, { sidPrefix: 'WW', what: 'workflow', hint: `Create one with create_workflow (pass this spec) in "${ws.friendly_name}".`, exactOnly: true, explicit: true });
         const queueNames = Object.fromEntries(qs.map((q) => [q.sid, q.friendly_name]));
         const unrouted = unroutedQueues(wf, queues, queueNames);
         if (unrouted.length) {
@@ -552,6 +589,10 @@ export const TOOLS = [
         workflow = { sid: wf.sid, name: wf.friendly_name, workspace: ws.friendly_name };
       }
       const definition = specToFlow(a.spec, { workflowSid: workflow?.sid });
+      // Defense in depth: the composed flow must pass the same egress rails
+      // the raw tool enforces (allowed widgets, no URLs).
+      const unsafe = definitionProblems(definition);
+      if (unsafe.length) return { valid: false, stage: 'safety', errors: unsafe };
       const name = a.spec.name;
       const status = a.publish ? 'published' : 'draft';
       try {
@@ -564,14 +605,14 @@ export const TOOLS = [
       const base = { valid: true, validated_by: 'POST https://studio.twilio.com/v2/Flows/Validate', gaps: v.gaps, workflow, widgets: definition.states.length, mermaid };
       if (a.dry_run) return { ...base, created: false, note: 'Dry run: composed and validated by Twilio, nothing created.' };
 
-      const existing = (await listFlows(tw)).filter((f) => lc(f.friendly_name) === lc(name));
+      const existing = (await listFlows(tw, { strict: true })).filter((f) => lc(f.friendly_name) === lc(name));
       let flow;
       if (existing.length) {
         if (!a.replace_draft) return { ...base, created: false, error: `A flow named "${name}" already exists (${existing.map((f) => f.sid).join(', ')}). Flow names are identity here: pick a new name, or pass replace_draft: true to save a new draft revision of it.` };
         if (existing.length > 1) return { ...base, created: false, error: `More than one flow is named "${name}"; update one by SID through the Twilio Console.` };
         const target = existing[0];
         if (a.publish) {
-          const pointing = numbersPointingAt(await listNumbers(tw), target.sid);
+          const pointing = numbersPointingAt(await listNumbers(tw, { strict: true }), target.sid);
           if (pointing.length) return { ...base, created: false, error: `Refused: ${pointing.join(', ')} point at "${name}", so publishing would change what live callers hear. Saved nothing. Build as a draft (omit publish), review it, and let a human publish in the Twilio Console.` };
         }
         flow = await tw.post('studio', `v2/Flows/${target.sid}`, { Status: status, Definition: JSON.stringify(definition), CommitMessage: 'Updated by twilio-mcp from the shared IVR spec' });
@@ -611,7 +652,7 @@ export const TOOLS = [
   // ----- power tool -----
   {
     name: 'twilio_api_call',
-    description: 'Call a Twilio REST endpoint directly, for anything without a typed tool. host is api.twilio.com, studio.twilio.com, or taskrouter.twilio.com (nothing else; no URL overrides). Reads: the account, phone numbers (read only), TwiML apps, Studio flows with revisions and execution logs, and TaskRouter configuration. Writes (POST, form parameters in `body`): Studio flows (create; updates only as Status draft; widget types limited to the IVR vocabulary, no external URLs), Studio Validate, and TaskRouter workspaces, activities, queues, and workflows. Always refused: DELETE, calls, messages, conversations, any phone number change or purchase, Studio Executions (they place calls), tasks, workers, credentials, *Url/*Callback parameters, and paths with encoding, dot segments, or query strings (use `query`). api.twilio.com paths must be under this account. Secrets are redacted. Treat any POST as a write: describe it and confirm with the user first.',
+    description: 'Call a Twilio REST endpoint directly, for anything without a typed tool. host is api.twilio.com, studio.twilio.com, or taskrouter.twilio.com (nothing else; no URL overrides). Reads: the account, phone numbers (read only), TwiML apps, Studio flows with revisions and execution status (caller number and context are withheld; Steps and Context are not readable), and TaskRouter configuration. Writes (POST, form parameters in `body`): Studio flows (create; updates only as Status draft; widget types limited to the IVR vocabulary, no external URLs), Studio Validate, and TaskRouter workspaces, activities, queues, and workflows. Always refused: DELETE, calls, messages, conversations, any phone number change or purchase, Studio Executions (they place calls), tasks, workers, credentials, *Url/*Callback parameters, and paths with encoding, dot segments, or query strings (use `query`). api.twilio.com paths must be under this account. Secrets are redacted. Treat any POST as a write: describe it and confirm with the user first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -620,6 +661,7 @@ export const TOOLS = [
         path: { type: 'string', description: 'Path on that host, e.g. "v2/Flows", "v1/Workspaces/WS.../TaskQueues", "2010-04-01/Accounts/AC.../IncomingPhoneNumbers.json". Plain segments only.' },
         query: { type: 'object', description: 'Query parameters (identifier keys, scalar values), e.g. { "PageSize": 20 }' },
         body: { type: 'object', description: 'Form parameters for POST, e.g. { "FriendlyName": "x" }. Definition/Configuration may be objects (sent as JSON strings).' },
+        confirm_live_update: { type: 'boolean', description: 'Required (true) to POST an update to an EXISTING task queue or workflow: those are live routing objects and the change applies to calls in flight immediately. Set it only after the user approved this exact change.' },
       },
       required: ['host', 'method', 'path'],
       additionalProperties: false,
@@ -628,7 +670,7 @@ export const TOOLS = [
       const c = checkRawCall(a, { accountSid: tw.accountSid });
       if (!c.ok) throw new TwilioError(c.message, 403);
       const res = await tw.request(c.host, c.method, c.path, { query: c.query, form: c.form });
-      return redactSecrets(res);
+      return redactSecrets(c.method === 'GET' ? scrubReadResponse(c.path, res) : res);
     },
   },
 ];
@@ -645,12 +687,16 @@ export async function callTool(cfg, name, args = {}) {
   const errors = validateArgs(tool.inputSchema, args ?? {});
   if (errors.length) throw new TwilioError(`Invalid arguments: ${errors.join('; ')}`, 400);
   const a = args ?? {};
-  if (tool.twilio === false) return tool.handler(null, a, cfg);
+  // Every tool's output passes through the redactor: by key name, by value
+  // shape, and by exact value (the configured Twilio secret and access key).
+  const known = [cfg.apiKeySecret, cfg.authToken].filter(Boolean);
+  const finish = (out) => redactSecrets(out, { known });
+  if (tool.twilio === false) return finish(await tool.handler(null, a, cfg));
   if (!cfg.configured) {
-    if (tool.twilio === 'optional') return tool.handler(null, a, cfg);
+    if (tool.twilio === 'optional') return finish(await tool.handler(null, a, cfg));
     throw new TwilioError('This server is not connected to Twilio yet - open /setup, or set the TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID / TWILIO_API_KEY_SECRET secrets.', 503);
   }
-  return tool.handler(new TwilioClient(cfg), a, cfg);
+  return finish(await tool.handler(new TwilioClient(cfg), a, cfg));
 }
 
 // UI metadata - which tools are writes, and how they group on the landing page.
