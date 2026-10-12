@@ -94,9 +94,17 @@ export class TwilioClient {
     }
     if (res.status === 204) return { ok: true };
     const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : { ok: true }; } catch { data = { raw: text.slice(0, 500) }; }
+    let data = null;
+    try { data = text ? JSON.parse(text) : { ok: true }; } catch { /* handled below */ }
+    const isObject = data !== null && typeof data === 'object' && !Array.isArray(data);
+    if (res.ok && !isObject) {
+      // A 2xx that is not a JSON object (an HTML error page from a proxy, a
+      // captive portal, a truncated body) is NOT success. Callers act on what
+      // they read here, so fail instead of guessing.
+      throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} returned HTTP ${res.status} with a body that is not a JSON object. Refusing to treat it as success.`, 502);
+    }
     if (!res.ok) {
+      data = isObject ? data : {};
       const msg = data.message || data.detail || `HTTP ${res.status}`;
       const more = data.more_info ? ` (${data.more_info})` : '';
       const code = data.code ? ` [${data.code}]` : '';

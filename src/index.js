@@ -7,31 +7,106 @@ import { handleOAuth, checkAuth, unauthorized } from './oauth.js';
 import { INSTRUCTIONS } from './about.js';
 import { landingPage, setupPage } from './ui.js';
 import { loadConfig, saveConfig, randomToken } from './config.js';
-import { isSid } from './rules.js';
+import { isSid, redactText } from './rules.js';
 
 export const SERVER_INFO = { name: 'twilio-mcp', version: '0.1.0' };
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
+// Request limits. A JSON-RPC call to this server is a few KB; 256 KB is
+// generous (a full Studio definition fits many times over).
+export const MAX_BODY_BYTES = 256 * 1024;
+export const MAX_BATCH = 10;
+
+const CORS_BASE = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Protocol-Version, Mcp-Session-Id',
   'Access-Control-Max-Age': '86400',
 };
 
+const isMcpPath = (path) => path === '/' || path === '/mcp';
+
 export default {
   async fetch(request, env) {
-    const res = await route(request, env);
-    for (const [k, v] of Object.entries(CORS_HEADERS)) res.headers.set(k, v);
+    let res;
+    try {
+      res = await route(request, env);
+    } catch (e) {
+      // Never echo exception text (it can carry request or config details).
+      console.error('unhandled error', e?.name || 'Error');
+      res = json({ error: 'Internal error' }, 500);
+    }
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const origin = request.headers.get('Origin');
+    for (const [k, v] of Object.entries(CORS_BASE)) res.headers.set(k, v);
+    if (isMcpPath(path) && origin) {
+      // The MCP endpoint answers browsers only for origins it accepts.
+      if (originAllowed(request, url, env)) res.headers.set('Access-Control-Allow-Origin', origin);
+      res.headers.append('Vary', 'Origin');
+    } else {
+      res.headers.set('Access-Control-Allow-Origin', '*');
+    }
+    res.headers.set('X-Content-Type-Options', 'nosniff');
     return res;
   },
 };
+
+// Browsers always send Origin on cross-origin requests; MCP clients that run
+// server-side (Claude and ChatGPT connectors, SDKs, curl) send none. So: no
+// Origin is fine, and a browser Origin must be this server itself, a known
+// MCP client web app, a local development page, or listed in the
+// MCP_ALLOWED_ORIGINS variable (comma separated; "*" turns the check off).
+const DEFAULT_ALLOWED_ORIGINS = ['https://claude.ai', 'https://www.claude.ai', 'https://claude.com', 'https://www.claude.com', 'https://chatgpt.com', 'https://chat.openai.com'];
+export function originAllowed(request, url, env) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  if (origin === url.origin) return true;
+  const extra = String(env?.MCP_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (extra.includes('*')) return true;
+  if (DEFAULT_ALLOWED_ORIGINS.includes(origin) || extra.includes(origin)) return true;
+  try {
+    const o = new URL(origin);
+    return o.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(o.hostname);
+  } catch { return false; }
+}
+
+// Reads a request body without ever holding more than `max` bytes. Returns
+// null when it is too large (checked up front via Content-Length, and again
+// while streaming, because Content-Length can be absent or wrong).
+async function readCapped(request, max) {
+  const declared = Number(request.headers.get('Content-Length'));
+  if (Number.isFinite(declared) && declared > max) return null;
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) { await reader.cancel().catch(() => {}); return null; }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  return new TextDecoder().decode(buf);
+}
 
 async function route(request, env) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204 });
+
+  // Cap every POST body (MCP, setup, and OAuth endpoints) before parsing.
+  if (request.method === 'POST') {
+    const text = await readCapped(request, MAX_BODY_BYTES);
+    if (text === null) return json({ error: `Request body too large (limit ${MAX_BODY_BYTES / 1024} KB).` }, 413);
+    const headers = new Headers(request.headers);
+    headers.delete('Content-Length');
+    request = new Request(request.url, { method: 'POST', headers, body: text });
+  }
 
   const cfg = await loadConfig(env);
 
@@ -43,9 +118,12 @@ async function route(request, env) {
   if (request.method === 'POST' && path === '/setup') return handleSetup(request, env, cfg);
   if (request.method === 'GET' && path === '/health') return json({ ok: true, server: SERVER_INFO, configured: cfg.configured });
 
-  if (path === '/' || path === '/mcp') {
+  if (isMcpPath(path)) {
     if (request.method !== 'POST') {
       return json({ error: 'MCP requests must be POSTed to /mcp' }, 405);
+    }
+    if (!originAllowed(request, url, env)) {
+      return json({ error: 'Origin not allowed. If a browser-based MCP client needs access, add its origin to the MCP_ALLOWED_ORIGINS variable.' }, 403);
     }
     // Fail closed: a server that can reach Twilio must have an access key.
     if (cfg.configured && !cfg.authToken) {
@@ -57,6 +135,7 @@ async function route(request, env) {
       return json(rpcError(null, -32700, 'Parse error: body must be JSON'), 400);
     }
     if (Array.isArray(body)) {
+      if (!body.length || body.length > MAX_BATCH) return json(rpcError(null, -32600, `Invalid batch: send between 1 and ${MAX_BATCH} messages`), 400);
       const results = (await Promise.all(body.map((m) => handleMessage(m, cfg)))).filter(Boolean);
       return results.length ? json(results) : new Response(null, { status: 202 });
     }
@@ -119,7 +198,7 @@ async function handleSetup(request, env, cfg) {
   });
 }
 
-async function handleMessage(msg, cfg) {
+export async function handleMessage(msg, cfg) {
   if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
     return rpcError(msg?.id ?? null, -32600, 'Invalid JSON-RPC 2.0 request');
   }
@@ -151,7 +230,8 @@ async function handleMessage(msg, cfg) {
           return rpcResult(id, { content: [{ type: 'text', text }], isError: false });
         } catch (e) {
           if (e instanceof TwilioError || e.message?.startsWith('Unknown tool')) {
-            return rpcResult(id, { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true });
+            const known = [cfg?.apiKeySecret, cfg?.authToken].filter(Boolean);
+            return rpcResult(id, { content: [{ type: 'text', text: `Error: ${redactText(e.message, known)}` }], isError: true });
           }
           throw e;
         }
@@ -160,7 +240,10 @@ async function handleMessage(msg, cfg) {
         return rpcError(id, -32601, `Method not found: ${method}`);
     }
   } catch (e) {
-    return rpcError(id, -32603, `Internal error: ${e.message}`);
+    // Unexpected failure: generic text only. The exception message can hold
+    // internals or secrets, so it is not returned (and not logged).
+    console.error('internal error in', method, e?.name || 'Error');
+    return rpcError(id, -32603, 'Internal error');
   }
 }
 
@@ -174,6 +257,15 @@ function json(data, status = 200) {
   });
 }
 
+// Pages are never framed (clickjacking on the setup wizard) and never cached.
 function html(markup) {
-  return new Response(markup, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(markup, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Frame-Options': 'DENY',
+      'Content-Security-Policy': "frame-ancestors 'none'",
+      'Referrer-Policy': 'no-referrer',
+      'Cache-Control': 'no-store',
+    },
+  });
 }
