@@ -30,6 +30,8 @@ function formBody(params) {
   return f;
 }
 
+const MAX_PAGES = 25;
+
 export class TwilioClient {
   constructor({ accountSid, apiKeySid, apiKeySecret }) {
     this.accountSid = accountSid;
@@ -104,15 +106,21 @@ export class TwilioClient {
   // only when they stay on the same pinned host. Caps at `max`.
   async listAll(hostKey, path, key, query = {}, { max = 500 } = {}) {
     const out = [];
+    let truncated = false;
     let page = await this.get(hostKey, path, { PageSize: Math.min(max, 200), ...query });
-    for (;;) {
+    for (let pages = 1; ; pages++) {
       out.push(...(page[key] || []));
       const next = page.meta?.next_page_url || (page.next_page_uri ? `https://${HOSTS[hostKey]}${page.next_page_uri}` : null);
-      if (!next || out.length >= max) break;
-      const u = new URL(next);
-      if (u.host !== HOSTS[hostKey] || u.protocol !== 'https:') break;
+      if (!next) break;
+      // There IS more data. Stopping now (cap reached, a link we refuse to
+      // follow, or a runaway pager) means the list is incomplete, and callers
+      // that decide "this name is free" or "nothing points here" must know.
+      if (out.length >= max || pages >= MAX_PAGES) { truncated = true; break; }
+      let u;
+      try { u = new URL(next); } catch { truncated = true; break; }
+      if (u.host !== HOSTS[hostKey] || u.protocol !== 'https:') { truncated = true; break; }
       page = await this.request(hostKey, 'GET', u.pathname, { _url: u });
     }
-    return { entities: out.slice(0, max), truncated: out.length > max };
+    return { entities: out.slice(0, max), truncated: truncated || out.length > max };
   }
 }

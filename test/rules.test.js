@@ -3,7 +3,7 @@
 // a blocklist guard, re-aimed at Twilio. They must all stay refused.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems } from '../src/rules.js';
+import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems, findDuplicateKeys, canonicalJson } from '../src/rules.js';
 
 const AC = `AC${'1'.repeat(32)}`;
 const OTHER = `AC${'2'.repeat(32)}`;
@@ -216,4 +216,42 @@ test('F1: a POST never carries a query string (second, unchecked parameter chann
   allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { Blank: '' }, body: { FriendlyName: 'x' } });
   // Reads keep their query.
   assert.deepEqual(allowed({ host: 'studio', method: 'GET', path: 'v2/Flows', query: { PageSize: 5 } }).query, { PageSize: '5' });
+});
+
+test('F5: findDuplicateKeys sees duplicates JSON.parse hides, including escaped and nested ones', () => {
+  assert.deepEqual(findDuplicateKeys('{"a":1,"b":2}'), []);
+  assert.deepEqual(findDuplicateKeys('{"a":1,"a":2}'), ['a']);
+  assert.deepEqual(findDuplicateKeys('{"a":1,"\\u0061":2}'), ['a']);
+  assert.deepEqual(findDuplicateKeys('{"o":{"k":1,"k":2}}'), ['k']);
+  assert.deepEqual(findDuplicateKeys('{"l":[{"x":1},{"x":2}]}'), [], 'the same key in sibling objects is fine');
+  assert.deepEqual(findDuplicateKeys('[{"x":1,"x":2}]'), ['x']);
+  assert.deepEqual(findDuplicateKeys('{"s":"a\\"b","t":"{\\"z\\":1,\\"z\\":2}"}'), [], 'quotes and braces inside strings are not structure');
+  assert.deepEqual(findDuplicateKeys('{"n":-1.5e3,"t":true,"f":false,"z":null,"a":[1,2,3]}'), []);
+  assert.throws(() => findDuplicateKeys('['.repeat(200) + ']'.repeat(200)), /too deeply/);
+});
+
+test('F5: string Definition and Configuration are re-serialized, never forwarded as written', () => {
+  const raw = '{ "states" : [ { "name":"Trigger", "type":"trigger", "properties":{}, "transitions":[] } ],\n  "initial_state" : "Trigger" }';
+  const r = allowed({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: raw } });
+  assert.equal(r.form.Definition, JSON.stringify(JSON.parse(raw)));
+  assert.ok(!r.form.Definition.includes(' '), 'no caller whitespace survives');
+  const cfgRaw = '{ "task_routing" : { "filters" : [ ] } }';
+  const w = allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: cfgRaw } });
+  assert.equal(w.form.Configuration, '{"task_routing":{"filters":[]}}');
+  // Objects still work and produce the same canonical bytes.
+  const o = allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: JSON.parse(cfgRaw) } });
+  assert.equal(o.form.Configuration, w.form.Configuration);
+});
+
+test('F5: duplicate keys in a JSON string field are refused (parser-differential smuggling)', () => {
+  const bad = '{"states":[{"name":"Trigger","type":"trigger","properties":{},"transitions":[]}],"initial_state":"Trigger","initial_state":"Elsewhere"}';
+  refused({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: bad } }, /repeats the key\(s\) "initial_state"/);
+  // The classic: a harmless first widget list, a dangerous second one that a first-wins parser would use.
+  const swap = '{"states":[{"name":"t","type":"trigger","properties":{},"transitions":[]}],"states":[{"name":"d","type":"make-outgoing-call-v2","properties":{},"transitions":[]}]}';
+  refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}`, body: { Status: 'draft', Definition: swap } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{"task_routing":{},"task_routing":{"filters":[]}}' } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{"a":{"b":1,"\\u0062":2}}' } }, /repeats the key/);
+  refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{not json' } }, /not valid JSON/);
+  assert.equal(canonicalJson('{"a":1}').value, '{"a":1}');
+  assert.equal(canonicalJson('{"a":1,"a":2}').ok, false);
 });

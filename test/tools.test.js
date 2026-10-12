@@ -249,3 +249,55 @@ test('F1: the raw tool refuses a POST with a query before any network call', asy
   await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', query: { EventCallbackUrl: 'https://evil.example' }, body: { FriendlyName: 'x' } }), /Refused/);
   assert.equal(calls.length, 0);
 });
+
+test('F5: listAll reports truncated for a cap, an off-host link, and a complete list', async () => {
+  const tw = new TwilioClient(cfg);
+  stub({ 'GET studio.twilio.com/v2/Flows': () => ({ flows: [{ sid: FW }], meta: { next_page_url: null } }) });
+  assert.equal((await tw.listAll('studio', 'v2/Flows', 'flows')).truncated, false);
+  stub({ 'GET studio.twilio.com/v2/Flows': () => ({ flows: [{ sid: FW }], meta: { next_page_url: 'https://evil.example/v2/Flows?Page=1' } }) });
+  assert.equal((await tw.listAll('studio', 'v2/Flows', 'flows')).truncated, true, 'off-host next link means more data we did not read');
+  stub({ 'GET studio.twilio.com/v2/Flows': ({ url }) => ({ flows: [{ sid: FW }, { sid: FW }], meta: { next_page_url: `https://studio.twilio.com/v2/Flows?Page=${Number(url.searchParams.get('Page') || 0) + 1}` } }) });
+  const capped = await tw.listAll('studio', 'v2/Flows', 'flows', {}, { max: 4 });
+  assert.equal(capped.entities.length, 4);
+  assert.equal(capped.truncated, true);
+  const runaway = await tw.listAll('studio', 'v2/Flows', 'flows');
+  assert.equal(runaway.truncated, true, 'a pager that never ends is cut off and flagged');
+});
+
+test('F5: duplicate-name checks fail closed when the list is truncated (nothing is created)', async () => {
+  const more = { next_page_url: 'https://evil.example/next' };
+  const calls = stub({
+    'GET taskrouter.twilio.com/v1/Workspaces': () => ({ workspaces: [{ sid: WS, friendly_name: 'MCP_Test_WS' }], meta: more }),
+    [`GET taskrouter.twilio.com/v1/Workspaces/${WS}/TaskQueues`]: () => ({ task_queues: [], meta: more }),
+    [`GET taskrouter.twilio.com/v1/Workspaces/${WS}/Workflows`]: () => ({ workflows: [], meta: more }),
+  });
+  await assert.rejects(callTool(cfg, 'create_workspace', { name: 'Brand_New' }), /longer than this server can read/);
+  await assert.rejects(callTool(cfg, 'create_task_queue', { workspace: WS, name: 'Brand_New' }), /longer than this server can read/);
+  await assert.rejects(callTool(cfg, 'create_workflow', { workspace: WS, name: 'Brand_New', queues: ['Sales'] }), /longer than this server can read/);
+  assert.ok(!calls.some((c) => c.method === 'POST'), 'no write happened');
+});
+
+test('F5: build_ivr fails closed on a truncated flow list or number list (the live-flow safety check)', async () => {
+  const more = { next_page_url: 'https://evil.example/next' };
+  // Truncated flow list: cannot prove the name is unused.
+  let w = twilioWorld();
+  w.routes['GET studio.twilio.com/v2/Flows'] = () => ({ flows: [], meta: more });
+  let calls = stub(w.routes);
+  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE }), /longer than this server can read/);
+  assert.ok(!calls.some((c) => c.method === 'POST' && c.path !== '/v2/Flows/Validate'), 'nothing created or updated');
+  // Truncated number list on a publish-over-existing: cannot prove no number points at the flow.
+  w = twilioWorld({ flows: [{ sid: FW, friendly_name: 'Main_Line', status: 'published' }] });
+  w.routes[`GET api.twilio.com/2010-04-01/Accounts/${AC}/IncomingPhoneNumbers.json`] = () => ({ incoming_phone_numbers: [], meta: more });
+  calls = stub(w.routes);
+  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE, replace_draft: true, publish: true }), /longer than this server can read/);
+  assert.ok(!calls.some((c) => c.method === 'POST' && c.path === `/v2/Flows/${FW}`), 'the published flow was not touched');
+});
+
+test('F5: read tools report a truncated list instead of presenting it as complete', async () => {
+  const more = { next_page_url: 'https://evil.example/next' };
+  const w = twilioWorld();
+  w.routes['GET studio.twilio.com/v2/Flows'] = () => ({ flows: [], meta: more });
+  stub(w.routes);
+  const res = await callTool(cfg, 'list_flows', {});
+  assert.equal(res.truncated, true);
+});

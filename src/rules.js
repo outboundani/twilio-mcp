@@ -153,10 +153,94 @@ export function definitionProblems(definition) {
   return problems;
 }
 
+// ---------- JSON canonicalization ----------
+
+// JSON.parse silently keeps the LAST duplicate key, but other parsers (and
+// Twilio's own) may keep the first. {"status":"draft","status":"published"}
+// is therefore ambiguous, and the checks in this file would only ever see one
+// of the two. This scanner reads the raw text of an ALREADY VALID JSON string
+// and returns every key that appears twice in the same object (keys are
+// compared after unescaping, so "a" and "\u0061" count as the same key).
+export function findDuplicateKeys(text) {
+  const dups = new Set();
+  const n = text.length;
+  let i = 0;
+  const ESC = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', '"': '"', '\\': '\\', '/': '/' };
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  const skipWs = () => { while (i < n && isWs(text[i])) i++; };
+  const readString = () => {
+    let out = '';
+    i++; // opening quote
+    while (i < n) {
+      const c = text[i];
+      if (c === '"') { i++; return out; }
+      if (c === '\\') {
+        const e = text[i + 1];
+        if (e === 'u') { out += String.fromCharCode(parseInt(text.slice(i + 2, i + 6), 16)); i += 6; } else { out += ESC[e] ?? e; i += 2; }
+      } else { out += c; i++; }
+    }
+    return out;
+  };
+  const readValue = (depth) => {
+    if (depth > MAX_DEPTH_JSON) throw new Error('JSON nests too deeply.');
+    skipWs();
+    const c = text[i];
+    if (c === '{') {
+      i++;
+      const seen = new Set();
+      skipWs();
+      if (text[i] === '}') { i++; return; }
+      for (;;) {
+        skipWs();
+        const k = readString();
+        if (seen.has(k)) dups.add(k);
+        seen.add(k);
+        skipWs(); i++; // colon
+        readValue(depth + 1);
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        i++; // closing brace
+        return;
+      }
+    } else if (c === '[') {
+      i++;
+      skipWs();
+      if (text[i] === ']') { i++; return; }
+      for (;;) {
+        readValue(depth + 1);
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        i++; // closing bracket
+        return;
+      }
+    } else if (c === '"') {
+      readString();
+    } else {
+      while (i < n && text[i] !== ',' && text[i] !== ']' && text[i] !== '}' && !isWs(text[i])) i++;
+    }
+  };
+  readValue(0);
+  return [...dups];
+}
+const MAX_DEPTH_JSON = 64;
+
+// A caller-supplied JSON string is never forwarded as written. It is parsed,
+// checked for duplicate keys, and re-serialized, so the bytes Twilio receives
+// are exactly the structure the checks above inspected.
+export function canonicalJson(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return { ok: false, message: 'is not valid JSON' }; }
+  let dups;
+  try { dups = findDuplicateKeys(text); } catch { return { ok: false, message: 'nests too deeply' }; }
+  if (dups.length) return { ok: false, message: `repeats the key(s) ${dups.map((k) => JSON.stringify(k)).join(', ')} (ambiguous: parsers disagree on which one wins)` };
+  return { ok: true, value: JSON.stringify(parsed) };
+}
+
 // ---------- the raw-API guard ----------
 
 const refuse = (message) => ({ ok: false, message });
 const MAX_DEPTH = 32;
+const JSON_FIELDS = ['definition', 'configuration', 'attributes'];
 
 function hasCaseDuplicateKeys(obj, depth = 0) {
   if (!obj || typeof obj !== 'object' || depth > MAX_DEPTH) return false;
@@ -260,9 +344,15 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
     if (!/^[A-Za-z][A-Za-z0-9_.]*$/.test(k)) return refuse(`Refused: form parameter "${k}" is not a plain identifier.`);
     if (/ur[li]$|callback/i.test(k)) return refuse(`Refused: ${k} would point Twilio at an external URL (webhook egress). Not allowed through the raw tool.`);
     if (v === undefined || v === null) continue;
+    const isJsonField = JSON_FIELDS.includes(k.toLowerCase());
     if (typeof v === 'object') {
-      if (!['definition', 'configuration', 'attributes'].includes(k.toLowerCase())) return refuse(`Refused: form parameter ${k} must be a scalar (only Definition, Configuration, and Attributes may be JSON objects).`);
+      if (!isJsonField) return refuse(`Refused: form parameter ${k} must be a scalar (only Definition, Configuration, and Attributes may be JSON objects).`);
       form[k] = JSON.stringify(v);
+    } else if (isJsonField && typeof v === 'string') {
+      // Canonical form only: the caller's raw string is never forwarded.
+      const c = canonicalJson(v);
+      if (!c.ok) return refuse(`Refused: ${k} ${c.message}.`);
+      form[k] = c.value;
     } else {
       form[k] = String(v);
     }
