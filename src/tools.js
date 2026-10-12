@@ -23,11 +23,26 @@ import {
 // ---------- shared helpers ----------
 
 const NAME_RE = /^[A-Za-z0-9 _.-]{1,64}$/;
+// Per-call cap on objects one tool call may create (queues via
+// create_missing_queues, activities, workflow routes). A runaway or prompt-
+// injected spec cannot mint hundreds of objects in one go.
+export const MAX_BULK_CREATE = 25;
 const lc = (s) => String(s ?? '').toLowerCase();
 const parseJson = (s, fallback = {}) => { try { return typeof s === 'string' ? JSON.parse(s) : (s ?? fallback); } catch { return fallback; } };
 
-function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint }) {
+// Resolves a reference (SID, name, or nothing) against a list.
+//   exactOnly: WRITE paths. A SID or a case-insensitive EXACT name only. No
+//             substring fallback, so "Prod" can never quietly mean
+//             "Production_Contact_Center".
+//   explicit: the reference may not be omitted, even when only one object
+//             exists. Used for existing objects a write wires into (no
+//             implicit "the only workflow" default).
+// Reads keep the forgiving behavior (substring match, single-object default).
+function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint, exactOnly = false, explicit = false }) {
   if (ref === undefined || ref === null || ref === '') {
+    if (explicit) {
+      throw new TwilioError(`This is a write: name the ${what} explicitly (SID or exact name)${list.length ? `. Options: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}` : ''}. ${hint || ''}`.trim(), 409);
+    }
     if (list.length === 1) return list[0];
     if (!list.length) throw new TwilioError(`No ${what} exists yet.${hint ? ` ${hint}` : ''}`, 404);
     throw new TwilioError(`There are ${list.length} ${what}s - say which one: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}.`, 409);
@@ -40,6 +55,7 @@ function pick(list, ref, { sidPrefix, what, nameKey = 'friendly_name', hint }) {
   const exact = list.filter((x) => lc(x[nameKey]) === lc(ref));
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) throw new TwilioError(`Ambiguous ${what} "${ref}" - use the SID: ${exact.map((x) => x.sid).join(', ')}.`, 409);
+  if (exactOnly) throw new TwilioError(`No ${what} named exactly "${ref}". Writes need a SID or the exact name (no partial matches).${list.length ? ` Options: ${list.map((x) => `${x[nameKey]} (${x.sid})`).join(', ')}.` : ''}`, 404);
   const wide = list.filter((x) => lc(x[nameKey]).includes(lc(ref)));
   if (wide.length === 1) return wide[0];
   if (wide.length > 1) throw new TwilioError(`Ambiguous ${what} "${ref}" - matches: ${wide.map((x) => x[nameKey]).join(', ')}.`, 409);
@@ -68,7 +84,7 @@ const listNumbers = async (tw, o) => toRows(await tw.listAll('api', tw.acct('/In
 const TRUNC_NOTE = 'This list was cut off (more entries exist than were read), so counts and "nothing points here" conclusions may be incomplete.';
 
 async function resolveWorkspace(tw, ref, { write = false } = {}) {
-  return pick(await listWorkspaces(tw, { strict: write }), ref, { sidPrefix: 'WS', what: 'workspace', hint: 'Create one with create_workspace.' });
+  return pick(await listWorkspaces(tw, { strict: write }), ref, { sidPrefix: 'WS', what: 'workspace', hint: 'Create one with create_workspace.', exactOnly: write });
 }
 
 async function resolveFlow(tw, ref) {
@@ -352,7 +368,7 @@ export const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Workspace name, e.g. "Acme Contact Center"' },
         activities: {
-          type: 'array', description: 'Override the default activities',
+          type: 'array', maxItems: MAX_BULK_CREATE, description: 'Override the default activities (at most 25)',
           items: { type: 'object', properties: { name: { type: 'string' }, available: { type: 'boolean' } }, required: ['name', 'available'], additionalProperties: false },
         },
         multi_task_enabled: { type: 'boolean', description: 'Enable multitasking (voice plus digital channels per agent). Default false.' },
@@ -417,7 +433,7 @@ export const TOOLS = [
       properties: {
         workspace: { type: 'string', description: 'Workspace name or SID (optional when there is exactly one)' },
         name: { type: 'string', description: 'Workflow name, e.g. "Main Line Routing"' },
-        queues: { type: 'array', items: { type: 'string' }, minItems: 1, description: 'Queue names to route to' },
+        queues: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: MAX_BULK_CREATE, description: 'Queue names to route to (at most 25)' },
         spec: { type: 'object', description: 'An IVR spec: route to every queue its transfer_to_queue actions name' },
         default_queue: { type: 'string', description: 'Queue for tasks that match no route (default: the first queue)' },
         create_missing_queues: { type: 'boolean', description: 'Create queues that do not exist yet (default false)' },
@@ -430,6 +446,7 @@ export const TOOLS = [
       if (!NAME_RE.test(a.name)) throw new TwilioError('Workflow names may use letters, digits, space, _, ., - (64 max).', 400);
       const names = a.queues?.length ? a.queues : (a.spec ? specQueues(a.spec) : []);
       if (!names.length) throw new TwilioError('Give queues (names) or an IVR spec with transfer_to_queue actions.', 400);
+      if (names.length > MAX_BULK_CREATE) throw new TwilioError(`A workflow call may route at most ${MAX_BULK_CREATE} queues (got ${names.length}). Split it up or build the rest in the Twilio Console.`, 400);
       const bad = names.filter((n) => !NAME_RE.test(n));
       if (bad.length) throw new TwilioError(`Queue names may use letters, digits, space, _, ., - only: ${bad.join(', ')}`, 400);
       const ws = await resolveWorkspace(tw, a.workspace, { write: true });
@@ -440,6 +457,9 @@ export const TOOLS = [
       const createdQueues = [];
       if (missing.length) {
         if (!a.create_missing_queues) throw new TwilioError(`These queues do not exist in "${ws.friendly_name}" yet: ${missing.join(', ')}. Create them with create_task_queue, or pass create_missing_queues: true.`, 404);
+        if (missing.length > MAX_BULK_CREATE) throw new TwilioError(`create_missing_queues creates at most ${MAX_BULK_CREATE} queues per call (${missing.length} are missing). Nothing was created.`, 400);
+        const variants = missing.filter((n) => qs.some((q) => lc(q.friendly_name) === lc(n)));
+        if (variants.length) throw new TwilioError(`Queue(s) ${variants.join(', ')} already exist with different capitalization. Use the exact existing name; this server will not create a look-alike queue. Nothing was created.`, 409);
         for (const n of missing) createdQueues.push((await createQueue(tw, ws.sid, { name: n })).friendly_name);
         qs = await listQueues(tw, ws.sid, { strict: true });
       }
@@ -556,7 +576,7 @@ export const TOOLS = [
       if (queues.length) {
         const ws = await resolveWorkspace(tw, a.workspace, { write: true });
         const [wfs, qs] = await Promise.all([listWorkflows(tw, ws.sid, { strict: true }), listQueues(tw, ws.sid, { strict: true })]);
-        const wf = pick(wfs, a.workflow, { sidPrefix: 'WW', what: 'workflow', hint: `Create one with create_workflow (pass this spec) in "${ws.friendly_name}".` });
+        const wf = pick(wfs, a.workflow, { sidPrefix: 'WW', what: 'workflow', hint: `Create one with create_workflow (pass this spec) in "${ws.friendly_name}".`, exactOnly: true, explicit: true });
         const queueNames = Object.fromEntries(qs.map((q) => [q.sid, q.friendly_name]));
         const unrouted = unroutedQueues(wf, queues, queueNames);
         if (unrouted.length) {
@@ -637,6 +657,7 @@ export const TOOLS = [
         path: { type: 'string', description: 'Path on that host, e.g. "v2/Flows", "v1/Workspaces/WS.../TaskQueues", "2010-04-01/Accounts/AC.../IncomingPhoneNumbers.json". Plain segments only.' },
         query: { type: 'object', description: 'Query parameters (identifier keys, scalar values), e.g. { "PageSize": 20 }' },
         body: { type: 'object', description: 'Form parameters for POST, e.g. { "FriendlyName": "x" }. Definition/Configuration may be objects (sent as JSON strings).' },
+        confirm_live_update: { type: 'boolean', description: 'Required (true) to POST an update to an EXISTING task queue or workflow: those are live routing objects and the change applies to calls in flight immediately. Set it only after the user approved this exact change.' },
       },
       required: ['host', 'method', 'path'],
       additionalProperties: false,

@@ -157,8 +157,8 @@ test('TaskRouter build writes are allowed', () => {
   allowed({ host: 'taskrouter', method: 'POST', path: 'v1/Workspaces', body: { FriendlyName: 'MCP_Test_ws' } });
   allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Activities`, body: { FriendlyName: 'Break', Available: false } });
   allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues`, body: { FriendlyName: 'Sales', TargetWorkers: "skills HAS 'Sales'" } });
-  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues/${WQ}`, body: { MaxReservedWorkers: 2 } });
-  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows/${WW}`, body: { TaskReservationTimeout: 60 } });
+  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues/${WQ}`, body: { MaxReservedWorkers: 2 }, confirm_live_update: true });
+  allowed({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows/${WW}`, body: { TaskReservationTimeout: 60 }, confirm_live_update: true });
 });
 
 test('SID placeholders are strict: wrong prefix or length never matches a template', () => {

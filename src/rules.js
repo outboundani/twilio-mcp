@@ -103,6 +103,24 @@ export const WRITES = [
 
 export const WRITE_FAMILIES = 'Studio flows (create, update as draft only, validate) and TaskRouter workspaces, activities, task queues, and workflows (create and update)';
 
+// Existing objects that are live the moment they change. See checkRawCall.
+const LIVE_UPDATE = ['v1/Workspaces/{WS}/TaskQueues/{WQ}', 'v1/Workspaces/{WS}/Workflows/{WW}'].map(R);
+
+// A short, safe description of a pending form for a refusal message. JSON
+// fields are summarized (size and top-level keys), long values are clipped.
+function describeChange(form) {
+  const parts = Object.entries(form).map(([k, v]) => {
+    if (isSecretKey(k)) return `${k}=[redacted]`;
+    if (JSON_FIELDS.includes(k.toLowerCase())) {
+      let keys = '';
+      try { const o = JSON.parse(v); keys = o && typeof o === 'object' ? ` with top-level keys ${Object.keys(o).join(', ') || '(none)'}` : ''; } catch { /* not JSON */ }
+      return `${k}=<JSON, ${v.length} chars${keys}>`;
+    }
+    return `${k}=${JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}...` : v)}`;
+  });
+  return parts.length ? parts.join(', ') : '(no fields)';
+}
+
 // Used by the HTTP client on EVERY non-GET request, typed tools included.
 export function isAllowedWrite(hostKey, method, path) {
   if (String(method).toUpperCase() !== 'POST') return false;
@@ -285,7 +303,7 @@ function familyRefusal(hostKey, m, segs) {
 // with the exact values to send, or { ok: false, message }. Nothing is sent
 // unless this says ok. `accountSid` binds api.twilio.com paths to the
 // configured account (no wandering into subaccounts or other accounts).
-export function checkRawCall({ host, method, path, query, body } = {}, { accountSid } = {}) {
+export function checkRawCall({ host, method, path, query, body, confirm_live_update: confirmLive } = {}, { accountSid } = {}) {
   const m = String(method ?? '').toUpperCase();
   if (m === 'DELETE') return refuse('Refused: this server ships no deletes, and the raw tool refuses DELETE by design.');
   if (!['GET', 'POST'].includes(m)) return refuse(`Refused: method ${m || '(none)'} is not allowed. Twilio uses GET to read and POST to create or update.`);
@@ -362,6 +380,15 @@ export function checkRawCall({ host, method, path, query, body } = {}, { account
   const table = m === 'GET' ? READS : WRITES;
   if (!table.some(([h, r]) => h === hostKey && r.test(rel))) {
     return refuse(`Refused: ${m} ${HOSTS[hostKey]}/${rel} is not on the raw tool's allowlist. Reads cover the account, phone numbers (read only), TwiML apps, Studio flows and their revisions/executions, and TaskRouter configuration. Writes are limited to ${WRITE_FAMILIES}. Deletes, calls, messages, numbers, executions, tasks, workers, and credentials are out of scope.`);
+  }
+
+  // Updating an EXISTING task queue or workflow edits live routing: the
+  // change applies to calls in flight the moment Twilio accepts it. Creates
+  // (POST to the collection) are not live until something routes to them, so
+  // only updates need the explicit flag. The refusal says what would change.
+  if (m === 'POST' && hostKey === 'taskrouter' && LIVE_UPDATE.some((r) => r.test(rel)) && confirmLive !== true) {
+    const kind = /\/TaskQueues\//.test(rel) ? 'task queue' : 'workflow';
+    return refuse(`Refused: POST ${rel} would UPDATE a live ${kind}, and the change applies to calls in flight immediately. It would set: ${describeChange(form)}. Show the user exactly this change, and only after they approve it re-send the same call with confirm_live_update: true. (Nothing was sent.)`);
   }
 
   // Studio write rules.

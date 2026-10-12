@@ -126,7 +126,7 @@ test('pagination never follows a next-page link off the pinned host', async () =
 test('build_ivr: route check -> Twilio Validate -> create as DRAFT, and the saved flow exports back to the spec', async () => {
   const w = twilioWorld();
   const calls = stub(w.routes);
-  const res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE });
+  const res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE });
   assert.equal(res.valid, true, JSON.stringify(res));
   assert.equal(res.created, true);
   assert.equal(res.status, 'draft');
@@ -147,7 +147,7 @@ test('build_ivr: route check -> Twilio Validate -> create as DRAFT, and the save
 test('build_ivr publish: true publishes a NEW flow (harmless: nothing points at it)', async () => {
   const w = twilioWorld();
   const calls = stub(w.routes);
-  const res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE, publish: true });
+  const res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, publish: true });
   assert.equal(res.status, 'published');
   assert.equal(calls.find((c) => c.path === '/v2/Flows' && c.method === 'POST').form.Status, 'published');
 });
@@ -155,7 +155,7 @@ test('build_ivr publish: true publishes a NEW flow (harmless: nothing points at 
 test('build_ivr refuses before sending anything when the workflow does not route a queue', async () => {
   const w = twilioWorld({ routed: ['Sales', 'Billing'] });
   const calls = stub(w.routes);
-  const res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE });
+  const res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE });
   assert.equal(res.valid, false);
   assert.equal(res.stage, 'routing');
   assert.ok(res.errors.some((e) => e.includes("selected_queue == 'Support'")));
@@ -166,7 +166,7 @@ test('build_ivr relays Twilio Validate errors verbatim and creates nothing', asy
   const details = { errors: [{ message: 'must match a widget name', property_path: '#/states/0/transitions/0/next' }], warnings: [] };
   const w = twilioWorld({ validate: () => ({ __status: 400, body: { code: 81022, message: 'Flow definition validation failed, check `details` for more information', status: 400, details } }) });
   const calls = stub(w.routes);
-  const res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE });
+  const res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE });
   assert.equal(res.valid, false);
   assert.equal(res.stage, 'twilio_validate');
   assert.deepEqual(res.twilio_errors, details.errors);
@@ -176,7 +176,7 @@ test('build_ivr relays Twilio Validate errors verbatim and creates nothing', asy
 test('build_ivr dry_run validates with Twilio and creates nothing', async () => {
   const w = twilioWorld();
   const calls = stub(w.routes);
-  const res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE, dry_run: true });
+  const res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, dry_run: true });
   assert.equal(res.valid, true);
   assert.equal(res.created, false);
   assert.deepEqual(calls.filter((c) => c.method === 'POST').map((c) => c.path), ['/v2/Flows/Validate']);
@@ -187,17 +187,17 @@ test('build_ivr: existing names are identity; replace_draft saves a draft; publi
   const live = [{ sid: `PN${'7'.repeat(32)}`, phone_number: '+15555550100', voice_url: `https://webhooks.twilio.com/v1/Accounts/${AC}/Flows/${FW}` }];
 
   let calls = stub(twilioWorld({ flows: existing }).routes);
-  let res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE });
+  let res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE });
   assert.match(res.error, /already exists/);
   assert.ok(!calls.some((c) => c.method === 'POST' && c.path.startsWith('/v2/Flows/FW')));
 
   calls = stub(twilioWorld({ flows: existing, numbers: live }).routes);
-  res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE, replace_draft: true });
+  res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, replace_draft: true });
   assert.equal(res.updated, true);
   assert.equal(calls.find((c) => c.path === `/v2/Flows/${FW}`).form.Status, 'draft');
 
   calls = stub(twilioWorld({ flows: existing, numbers: live }).routes);
-  res = await callTool(cfg, 'build_ivr', { spec: EXAMPLE, replace_draft: true, publish: true });
+  res = await callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, replace_draft: true, publish: true });
   assert.match(res.error, /\+15555550100 point at "Main_Line"/);
   assert.ok(!calls.some((c) => c.path === `/v2/Flows/${FW}` && c.method === 'POST'));
 });
@@ -209,7 +209,7 @@ test('render_flow and about need no Twilio connection; argument validation is en
   assert.equal(r.valid, true);
   assert.match(await callTool(off, 'about'), /API landmines/);
   await assert.rejects(callTool(off, 'list_flows'), /not connected to Twilio/);
-  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE, surprise: 1 }), /not a known argument/);
+  await assert.rejects(callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, surprise: 1 }), /not a known argument/);
   await assert.rejects(callTool(cfg, 'create_task_queue', {}), /name is required/);
   assert.equal(calls.length, 0);
 });
@@ -283,13 +283,13 @@ test('F5: build_ivr fails closed on a truncated flow list or number list (the li
   let w = twilioWorld();
   w.routes['GET studio.twilio.com/v2/Flows'] = () => ({ flows: [], meta: more });
   let calls = stub(w.routes);
-  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE }), /longer than this server can read/);
+  await assert.rejects(callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE }), /longer than this server can read/);
   assert.ok(!calls.some((c) => c.method === 'POST' && c.path !== '/v2/Flows/Validate'), 'nothing created or updated');
   // Truncated number list on a publish-over-existing: cannot prove no number points at the flow.
   w = twilioWorld({ flows: [{ sid: FW, friendly_name: 'Main_Line', status: 'published' }] });
   w.routes[`GET api.twilio.com/2010-04-01/Accounts/${AC}/IncomingPhoneNumbers.json`] = () => ({ incoming_phone_numbers: [], meta: more });
   calls = stub(w.routes);
-  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE, replace_draft: true, publish: true }), /longer than this server can read/);
+  await assert.rejects(callTool(cfg, 'build_ivr', { workflow: WW, spec: EXAMPLE, replace_draft: true, publish: true }), /longer than this server can read/);
   assert.ok(!calls.some((c) => c.method === 'POST' && c.path === `/v2/Flows/${FW}`), 'the published flow was not touched');
 });
 
@@ -300,4 +300,83 @@ test('F5: read tools report a truncated list instead of presenting it as complet
   stub(w.routes);
   const res = await callTool(cfg, 'list_flows', {});
   assert.equal(res.truncated, true);
+});
+
+test('F3: write paths resolve a workspace by SID or EXACT name only (no substring), reads stay forgiving', async () => {
+  const w = twilioWorld();
+  const calls = stub(w.routes);
+  // Reads may match by substring.
+  const r = await callTool(cfg, 'list_task_queues', { workspace: 'Test_WS' });
+  assert.equal(r.workspace, 'MCP_Test_WS');
+  // Writes may not: "Test_WS" is a substring of MCP_Test_WS but not its name.
+  await assert.rejects(callTool(cfg, 'create_task_queue', { workspace: 'Test_WS', name: 'Brand_New' }), /named exactly "Test_WS"/);
+  await assert.rejects(callTool(cfg, 'create_workflow', { workspace: 'mcp_test', name: 'W', queues: ['Sales'] }), /named exactly/);
+  await assert.rejects(callTool(cfg, 'build_ivr', { workspace: 'Test', workflow: WW, spec: EXAMPLE }), /named exactly/);
+  assert.ok(!calls.some((c) => c.method === 'POST'));
+  // Exact name (any case) and SID both work.
+  const byName = await callTool(cfg, 'create_task_queue', { workspace: 'mcp_test_ws', name: 'Brand_New' }).catch((e) => e);
+  assert.ok(!/named exactly/.test(byName.message ?? ''), 'case-insensitive exact name resolves');
+  const bySid = await callTool(cfg, 'create_task_queue', { workspace: WS, name: 'Brand_New2' }).catch((e) => e);
+  assert.ok(!/named exactly/.test(bySid.message ?? ''), 'a SID resolves');
+});
+
+test('F3: with several workspaces a write must name one; the implicit single default stays only for a lone container', async () => {
+  const w = twilioWorld();
+  w.routes['GET taskrouter.twilio.com/v1/Workspaces'] = () => ({ workspaces: [{ sid: WS, friendly_name: 'One' }, { sid: `WS${'5'.repeat(32)}`, friendly_name: 'Two' }], meta: {} });
+  const calls = stub(w.routes);
+  await assert.rejects(callTool(cfg, 'create_task_queue', { name: 'Brand_New' }), /There are 2 workspaces - say which one/);
+  await assert.rejects(callTool(cfg, 'create_workflow', { name: 'W', queues: ['Sales'] }), /say which one/);
+  assert.ok(!calls.some((c) => c.method === 'POST'));
+});
+
+test('F3: build_ivr needs the workflow named explicitly (SID or exact name); no implicit single-workflow default, no substring', async () => {
+  const w = twilioWorld();
+  const calls = stub(w.routes);
+  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE }), /name the workflow explicitly/);
+  await assert.rejects(callTool(cfg, 'build_ivr', { spec: EXAMPLE, workflow: 'Routing' }), /named exactly "Routing"/);
+  assert.ok(!calls.some((c) => c.method === 'POST'), 'nothing posted, not even Validate');
+  const ok = await callTool(cfg, 'build_ivr', { spec: EXAMPLE, workflow: 'mcp_test_routing', dry_run: true });
+  assert.equal(ok.valid, true);
+  assert.equal(ok.workflow.sid, WW);
+});
+
+test('F3: create_missing_queues is capped per call and never creates a case-variant look-alike', async () => {
+  const w = twilioWorld();
+  const calls = stub(w.routes);
+  const many = Array.from({ length: 26 }, (_, i) => `Q${i}`);
+  // The schema caps the array...
+  await assert.rejects(callTool(cfg, 'create_workflow', { workspace: WS, name: 'Big', queues: many, create_missing_queues: true }), /allows at most 25/);
+  // 25 missing queues are allowed in principle; a case variant of an existing queue is not created.
+  await assert.rejects(callTool(cfg, 'create_workflow', { workspace: WS, name: 'Look', queues: ['sales'], create_missing_queues: true }), /different capitalization/);
+  assert.ok(!calls.some((c) => c.method === 'POST'), 'nothing was created');
+});
+
+test('F3: the 25-queue cap also applies to a spec-derived queue list', async () => {
+  const w = twilioWorld();
+  const calls = stub(w.routes);
+  // Build a spec-shaped input through the handler's spec path with more than 25 distinct queues
+  // by nesting submenus (3 levels x 10 digits is enough distinct targets).
+  const leaf = (prefix) => ({ prompt: 'p', options: Array.from({ length: 10 }, (_, i) => ({ digit: String(i), action: { type: 'transfer_to_queue', queue: `${prefix}${i}` } })) });
+  const spec = { name: 'Huge', menu: { prompt: 'p', options: ['1', '2', '3'].map((d) => ({ digit: d, action: { type: 'submenu', menu: leaf(`M${d}_`) } })) } };
+  await assert.rejects(callTool(cfg, 'create_workflow', { workspace: WS, name: 'Huge', spec, create_missing_queues: true }), /at most 25 queues/);
+  assert.ok(!calls.some((c) => c.method === 'POST'));
+});
+
+test('F3: the raw tool will not UPDATE a live queue or workflow without confirm_live_update: true', async () => {
+  const q = `v1/Workspaces/${WS}/TaskQueues/WQ${'5'.repeat(32)}`;
+  const wf = `v1/Workspaces/${WS}/Workflows/${WW}`;
+  const calls = stub({
+    [`POST taskrouter.twilio.com/${q}`]: () => ({ sid: 'WQ', friendly_name: 'x' }),
+    [`POST taskrouter.twilio.com/${wf}`]: () => ({ sid: WW, friendly_name: 'x' }),
+    [`POST taskrouter.twilio.com/v1/Workspaces/${WS}/TaskQueues`]: () => ({ sid: 'WQ', friendly_name: 'x' }),
+  });
+  const body = { Configuration: { task_routing: { filters: [] } }, FriendlyName: 'Renamed' };
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: wf, body }), /would UPDATE a live workflow.*Configuration=<JSON, \d+ chars with top-level keys task_routing>, FriendlyName="Renamed"/);
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: q, body: { TargetWorkers: '1==1' } }), /would UPDATE a live task queue.*TargetWorkers="1==1"/);
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: wf, body, confirm_live_update: 'true' }), /Invalid arguments.*boolean/);
+  assert.equal(calls.length, 0, 'refused before any network call');
+  // Explicit true goes through; creating a new queue (collection POST) needs no flag.
+  await callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: wf, body, confirm_live_update: true });
+  await callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues`, body: { FriendlyName: 'New' } });
+  assert.equal(calls.length, 2);
 });
