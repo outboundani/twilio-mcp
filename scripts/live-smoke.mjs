@@ -101,16 +101,16 @@ receipts.queue_created_directly = q1 && q1.sid;
 await step('list_workers (none yet)', () => call('list_workers', { workspace: wsName }), (o) => o.total === 0);
 
 await step('render_flow (spec preview)', () => call('render_flow', { spec }), (o) => o.valid && o.mermaid.startsWith('flowchart TD') && o.gaps.length === 1);
-await step('build_ivr dry_run (Twilio Validate, nothing created)', () => call('build_ivr', { spec, workspace: wsName, dry_run: true }),
+await step('build_ivr dry_run (Twilio Validate, nothing created)', () => call('build_ivr', { spec, workspace: wsName, workflow: wfName, dry_run: true }),
   (o) => o.valid && o.created === false && o.workflow?.sid === wf?.sid);
 const bad = JSON.parse(JSON.stringify(spec));
 bad.menu.options[0].action.queue = `${P}Nowhere`;
-await step('build_ivr refuses an unrouted queue before sending anything', () => call('build_ivr', { spec: bad, workspace: wsName }), (o) => o.valid === false && o.stage === 'routing');
+await step('build_ivr refuses an unrouted queue before sending anything', () => call('build_ivr', { spec: bad, workspace: wsName, workflow: wfName }), (o) => o.valid === false && o.stage === 'routing');
 
-const flow = await step(`build_ivr ${spec.name} (draft)`, () => call('build_ivr', { spec, workspace: wsName }),
+const flow = await step(`build_ivr ${spec.name} (draft)`, () => call('build_ivr', { spec, workspace: wsName, workflow: wfName }),
   (o) => o.created && o.status === 'draft' && o.sid.startsWith('FW') && o.live === false && o.gaps[0].startsWith('hours'));
 receipts.flow = flow && { name: flow.name, sid: flow.sid, status: flow.status, revision: flow.revision, webhook_url: flow.webhook_url, widgets: flow.widgets, twilio_valid: flow.twilio_valid };
-await step('build_ivr refuses the same name again', () => call('build_ivr', { spec, workspace: wsName }), (o) => /already exists/.test(o.error || ''));
+await step('build_ivr refuses the same name again', () => call('build_ivr', { spec, workspace: wsName, workflow: wfName }), (o) => /already exists/.test(o.error || ''));
 
 if (flow) {
   const tw = new TwilioClient(cfg);
