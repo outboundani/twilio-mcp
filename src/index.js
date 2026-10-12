@@ -3,7 +3,7 @@
 
 import { TwilioError, TwilioClient } from './twilio.js';
 import { toolDefs, callTool } from './tools.js';
-import { handleOAuth, checkAuth, unauthorized } from './oauth.js';
+import { handleOAuth, checkAuth, unauthorized, ctEqual } from './oauth.js';
 import { INSTRUCTIONS } from './about.js';
 import { landingPage, setupPage } from './ui.js';
 import { loadConfig, saveConfig, randomToken } from './config.js';
@@ -110,7 +110,8 @@ async function route(request, env) {
 
   const cfg = await loadConfig(env);
 
-  const oauthRes = await handleOAuth(request, cfg.authToken, url);
+  const extraRedirectSchemes = String(env.OAUTH_EXTRA_REDIRECT_SCHEMES ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const oauthRes = await handleOAuth(request, cfg.authToken, url, { extraRedirectSchemes });
   if (oauthRes) return oauthRes;
 
   if (request.method === 'GET' && path === '/') return html(landingPage(toolDefs(), cfg));
@@ -162,7 +163,7 @@ async function handleSetup(request, env, cfg) {
   if (cfg.configured) {
     const auth = request.headers.get('Authorization') || '';
     const presented = auth.startsWith('Bearer ') ? auth.slice(7).trim() : (body.current_key || '');
-    if (!cfg.authToken || presented !== cfg.authToken) {
+    if (!cfg.authToken || !(await ctEqual(presented, cfg.authToken))) {
       return json({ error: 'This server is already configured - enter its current access key to make changes.' }, 401);
     }
   }

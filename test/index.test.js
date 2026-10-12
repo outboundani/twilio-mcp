@@ -110,3 +110,39 @@ test('F7: a crash inside routing becomes a generic 500', async () => {
   assert.equal(res.status, 500);
   assert.deepEqual(await res.json(), { error: 'Internal error' });
 });
+
+test('F4: /mcp end to end: no key, wrong key, raw key, and a minted token for THIS origin', async () => {
+  const KEY = 'k'.repeat(64);
+  const env = { MCP_AUTH_TOKEN: KEY };
+  const ping = (auth, base = BASE) => call(new Request(`${base}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(auth ? { Authorization: auth } : {}) }, body: JSON.stringify(rpc(1, 'ping')) }), env);
+  assert.equal((await ping()).status, 401);
+  assert.match((await ping()).headers.get('WWW-Authenticate'), /resource_metadata=/);
+  assert.equal((await ping('Bearer wrong')).status, 401);
+  assert.equal((await ping(`Bearer ${KEY}`)).status, 200);
+  const { mintToken } = await import('../src/oauth.js');
+  const tok = await mintToken(KEY, { t: 'a', aud: `${BASE}/mcp`, ci: 'c', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 60 });
+  assert.equal((await ping(`Bearer ${tok}`)).status, 200);
+  assert.equal((await ping(`Bearer ${tok}`, 'https://other.example.test')).status, 401, 'audience-pinned: not valid on another host');
+});
+
+test('F4: a server with Twilio credentials but no access key fails closed', async () => {
+  const env = { TWILIO_ACCOUNT_SID: `AC${'1'.repeat(32)}`, TWILIO_API_KEY_SID: `SK${'2'.repeat(32)}`, TWILIO_API_KEY_SECRET: 'secretsecret' };
+  const res = await call(post(rpc(1, 'ping')), env);
+  assert.equal(res.status, 503);
+});
+
+test('F4: redirect URI schemes are configurable through OAUTH_EXTRA_REDIRECT_SCHEMES (off by default)', async () => {
+  const reg = (env) => call(new Request(`${BASE}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['cursor://x/cb'], client_name: 'Cursor' }) }), env);
+  const KEY = 'k'.repeat(64);
+  assert.equal((await reg({ MCP_AUTH_TOKEN: KEY })).status, 400);
+  assert.equal((await reg({ MCP_AUTH_TOKEN: KEY, OAUTH_EXTRA_REDIRECT_SCHEMES: 'cursor, vscode' })).status, 201);
+});
+
+test('F4: the setup wizard compares the access key in constant time and still rejects a wrong key', async () => {
+  const KV = { get: async () => ({ accountSid: `AC${'1'.repeat(32)}`, apiKeySid: `SK${'2'.repeat(32)}`, apiKeySecret: 'secretsecret', authToken: 'good-access-key-0123456789' }), put: async () => { throw new Error('must not save'); } };
+  const body = (extra) => JSON.stringify({ account_sid: `AC${'1'.repeat(32)}`, api_key_sid: `SK${'2'.repeat(32)}`, api_key_secret: 'x', ...extra });
+  const wrong = await call(new Request(`${BASE}/setup`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer nope' }, body: body({}) }), { CONFIG: KV });
+  assert.equal(wrong.status, 401);
+  const wrong2 = await call(new Request(`${BASE}/setup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body({ current_key: 'good-access-key-012345678' }) }), { CONFIG: KV });
+  assert.equal(wrong2.status, 401, 'a prefix of the key is not the key');
+});

@@ -9,6 +9,9 @@ compatibility_date = "2026-08-01"
 #      TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID / TWILIO_API_KEY_SECRET /
 #      MCP_AUTH_TOKEN
 #
+# Optional variables (see README, "Security configuration"):
+#   MCP_ALLOWED_ORIGINS, OAUTH_EXTRA_REDIRECT_SCHEMES
+#
 # KV namespace for wizard-managed config. The `id` is intentionally omitted so
 # the namespace is auto-provisioned into the deploying account: the "Deploy to
 # Cloudflare" button and `npx wrangler deploy` both create it and write the id
