@@ -63,10 +63,12 @@ const READS = [
   T('studio', 'v2/Flows/{FW}'),
   T('studio', 'v2/Flows/{FW}/Revisions'),
   T('studio', 'v2/Flows/{FW}/Revisions/{REV}'),
+  // Executions are listed for status only. Their Context and Steps carry the
+  // caller's number and whatever the caller said or pressed (PII), so those two
+  // sub-resources are not readable, and the Execution rows themselves are
+  // scrubbed of caller fields (see scrubReadResponse).
   T('studio', 'v2/Flows/{FW}/Executions'),
   T('studio', 'v2/Flows/{FW}/Executions/{FN}'),
-  T('studio', 'v2/Flows/{FW}/Executions/{FN}/Steps'),
-  T('studio', 'v2/Flows/{FW}/Executions/{FN}/Context'),
   T('taskrouter', 'v1/Workspaces'),
   T('taskrouter', 'v1/Workspaces/{WS}'),
   T('taskrouter', 'v1/Workspaces/{WS}/Statistics'),
@@ -132,15 +134,50 @@ export function isAllowedWrite(hostKey, method, path) {
 
 const normKey = (k) => String(k).toLowerCase().replace(/[_-]/g, '');
 // The Account resource carries auth_token (empty under API-key auth, but
-// never trust that); keys and credentials resources carry secrets.
-const SECRET_KEY = /authtoken|secret|passw|credential|apikey|privatekey|signingkey/;
+// never trust that); keys and credentials resources carry secrets. A bare
+// "key" is NOT here on purpose: Studio set-variables widgets use { key, value }.
+const SECRET_KEY = /token|secret|passw|credential|apikey|privatekey|signingkey|accesskey|secretkey|authorization|bearer/;
 const isSecretKey = (k) => SECRET_KEY.test(normKey(k));
 
-export function redactSecrets(value) {
-  if (Array.isArray(value)) return value.map(redactSecrets);
+// Secret SHAPES inside free text (a string value, an error message, a JSON
+// document stored as a string): "Authorization: Bearer abc", "token=abc",
+// "password: abc", "?sig=abc", "api_key":"abc".
+const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]{6,}/gi;
+const KV_SECRET = /\b(authorization|auth[_-]?token|access[_-]?token|refresh[_-]?token|token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)(["']?\s*[:=]\s*["']?)(?!\[redacted\]|Bearer\s+\[redacted\])([^\s"',;&}]{4,})/gi;
+const URL_SECRET = /([?&](?:sig|signature|key|auth|code)=)([^&\s"']{4,})/gi;
+
+export function redactText(text, known = []) {
+  let s = String(text);
+  for (const k of known) if (typeof k === 'string' && k.length >= 8) s = s.split(k).join('[redacted]');
+  return s.replace(BEARER, 'Bearer [redacted]').replace(KV_SECRET, '$1$2[redacted]').replace(URL_SECRET, '$1[redacted]');
+}
+
+// Redacts by key name AND by value shape, recursively. `known` is a list of
+// exact secret values (the configured API key secret, the MCP access key)
+// that are scrubbed wherever they appear.
+export function redactSecrets(value, { known = [] } = {}, depth = 0) {
+  if (typeof value === 'string') return redactText(value, known);
+  if (Array.isArray(value)) return depth > 64 ? [] : value.map((v) => redactSecrets(v, { known }, depth + 1));
   if (!value || typeof value !== 'object') return value;
+  if (depth > 64) return {};
   const out = {};
-  for (const [k, v] of Object.entries(value)) out[k] = isSecretKey(k) && v !== null && v !== '' ? '[redacted]' : redactSecrets(v);
+  for (const [k, v] of Object.entries(value)) out[k] = isSecretKey(k) && v !== null && v !== '' ? '[redacted]' : redactSecrets(v, { known }, depth + 1);
+  return out;
+}
+
+// Fields on Studio Execution rows that identify or quote the caller.
+const EXECUTION_PII = new Set(['context', 'contact_channel_address', 'contact_sid']);
+
+// Applied to raw READ responses before they reach the model.
+export function scrubReadResponse(rel, value, depth = 0) {
+  if (!/(^|\/)Executions(\/|$)/.test(rel)) return value;
+  if (Array.isArray(value)) return value.map((v) => scrubReadResponse(rel, v, depth + 1));
+  if (!value || typeof value !== 'object' || depth > 16) return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (EXECUTION_PII.has(k.toLowerCase())) out[k] = '[withheld: caller data]';
+    else out[k] = scrubReadResponse(rel, v, depth + 1);
+  }
   return out;
 }
 
@@ -153,9 +190,41 @@ export function redactSecrets(value) {
 // no Flex handoff.
 export const SAFE_WIDGETS = new Set(['trigger', 'say-play', 'gather-input-on-call', 'split-based-on', 'set-variables', 'enqueue-call', 'record-voicemail']);
 
+// Hosts a raw-written flow may reference in a URL-VALUED property that is not
+// named *_url (say-play's `play` is the one that matters: an audio file the
+// flow fetches on every call). Empty by default: a flow written through the
+// raw tool plays text via `say`, not remote audio. To allow your own media
+// host, add its exact hostname here (or "*.example.com" for subdomains).
+// Properties NAMED *_url / *_uri / *callback* are always refused, allowlist or not.
+export const ALLOWED_URL_HOSTS = [];
+
+const URL_VALUE = /^\s*(?:[a-z][a-z0-9+.-]*:)?\/\/\S+\s*$/i;
+function urlAllowed(value, allowed) {
+  let host;
+  try { host = new URL(value.trim().startsWith('//') ? `https:${value.trim()}` : value.trim()).hostname.toLowerCase(); } catch { return false; }
+  return allowed.some((h) => (h.startsWith('*.') ? host.endsWith(h.slice(1)) && host.length > h.length - 1 : host === h.toLowerCase()));
+}
+
+// Walks a widget's properties at ANY depth (set-variables, gather options,
+// nested objects and arrays), not just the top level.
+function propertyProblems(node, name, allowed, path, out, depth = 0) {
+  if (depth > MAX_DEPTH) { out.push(`widget "${name}" nests properties too deeply`); return; }
+  if (Array.isArray(node)) { node.forEach((x, i) => propertyProblems(x, name, allowed, `${path}[${i}]`, out, depth + 1)); return; }
+  if (typeof node === 'string') {
+    if (URL_VALUE.test(node) && !urlAllowed(node, allowed)) out.push(`widget "${name}" has a URL value at ${path} (remote URLs are not allowed unless the host is on ALLOWED_URL_HOSTS)`);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  for (const [k, v] of Object.entries(node)) {
+    if (/_?ur[li]$/i.test(k) || /callback/i.test(k)) out.push(`widget "${name}" sets ${path ? `${path}.` : ''}${k} (external URLs are not allowed)`);
+    propertyProblems(v, name, allowed, path ? `${path}.${k}` : k, out, depth + 1);
+  }
+}
+
 // Returns a list of problems (empty = fine). Also refuses any *_url
-// property (hold music, callbacks, recording webhooks): no egress.
-export function definitionProblems(definition) {
+// property (hold music, callbacks, recording webhooks) and any URL-valued
+// property (play) at any depth unless its host is allowlisted: no egress.
+export function definitionProblems(definition, { allowedUrlHosts = ALLOWED_URL_HOSTS } = {}) {
   let def = definition;
   if (typeof def === 'string') {
     try { def = JSON.parse(def); } catch { return ['Definition is not valid JSON.']; }
@@ -164,9 +233,7 @@ export function definitionProblems(definition) {
   const problems = [];
   for (const s of def.states) {
     if (!SAFE_WIDGETS.has(s?.type)) problems.push(`widget "${s?.name}" has type "${s?.type}", which is outside this server's allowed set (${[...SAFE_WIDGETS].join(', ')})`);
-    for (const k of Object.keys(s?.properties || {})) {
-      if (/_?ur[li]$/i.test(k) || /callback/i.test(k)) problems.push(`widget "${s?.name}" sets ${k} (external URLs are not allowed)`);
-    }
+    propertyProblems(s?.properties, s?.name, allowedUrlHosts, '', problems);
   }
   return problems;
 }

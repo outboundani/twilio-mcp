@@ -14,7 +14,7 @@
 
 import { TwilioClient, TwilioError } from './twilio.js';
 import { ABOUT } from './about.js';
-import { checkRawCall, redactSecrets, validateArgs, isSid } from './rules.js';
+import { checkRawCall, redactSecrets, scrubReadResponse, definitionProblems, validateArgs, isSid } from './rules.js';
 import {
   validateSpec, normalizeSpec, specToFlow, flowToSpec, specToMermaid, definitionToMermaid,
   specQueues, QUEUE_ATTR, NORMALIZATIONS, HOURS_GAP,
@@ -589,6 +589,10 @@ export const TOOLS = [
         workflow = { sid: wf.sid, name: wf.friendly_name, workspace: ws.friendly_name };
       }
       const definition = specToFlow(a.spec, { workflowSid: workflow?.sid });
+      // Defense in depth: the composed flow must pass the same egress rails
+      // the raw tool enforces (allowed widgets, no URLs).
+      const unsafe = definitionProblems(definition);
+      if (unsafe.length) return { valid: false, stage: 'safety', errors: unsafe };
       const name = a.spec.name;
       const status = a.publish ? 'published' : 'draft';
       try {
@@ -648,7 +652,7 @@ export const TOOLS = [
   // ----- power tool -----
   {
     name: 'twilio_api_call',
-    description: 'Call a Twilio REST endpoint directly, for anything without a typed tool. host is api.twilio.com, studio.twilio.com, or taskrouter.twilio.com (nothing else; no URL overrides). Reads: the account, phone numbers (read only), TwiML apps, Studio flows with revisions and execution logs, and TaskRouter configuration. Writes (POST, form parameters in `body`): Studio flows (create; updates only as Status draft; widget types limited to the IVR vocabulary, no external URLs), Studio Validate, and TaskRouter workspaces, activities, queues, and workflows. Always refused: DELETE, calls, messages, conversations, any phone number change or purchase, Studio Executions (they place calls), tasks, workers, credentials, *Url/*Callback parameters, and paths with encoding, dot segments, or query strings (use `query`). api.twilio.com paths must be under this account. Secrets are redacted. Treat any POST as a write: describe it and confirm with the user first.',
+    description: 'Call a Twilio REST endpoint directly, for anything without a typed tool. host is api.twilio.com, studio.twilio.com, or taskrouter.twilio.com (nothing else; no URL overrides). Reads: the account, phone numbers (read only), TwiML apps, Studio flows with revisions and execution status (caller number and context are withheld; Steps and Context are not readable), and TaskRouter configuration. Writes (POST, form parameters in `body`): Studio flows (create; updates only as Status draft; widget types limited to the IVR vocabulary, no external URLs), Studio Validate, and TaskRouter workspaces, activities, queues, and workflows. Always refused: DELETE, calls, messages, conversations, any phone number change or purchase, Studio Executions (they place calls), tasks, workers, credentials, *Url/*Callback parameters, and paths with encoding, dot segments, or query strings (use `query`). api.twilio.com paths must be under this account. Secrets are redacted. Treat any POST as a write: describe it and confirm with the user first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -666,7 +670,7 @@ export const TOOLS = [
       const c = checkRawCall(a, { accountSid: tw.accountSid });
       if (!c.ok) throw new TwilioError(c.message, 403);
       const res = await tw.request(c.host, c.method, c.path, { query: c.query, form: c.form });
-      return redactSecrets(res);
+      return redactSecrets(c.method === 'GET' ? scrubReadResponse(c.path, res) : res);
     },
   },
 ];
@@ -683,12 +687,16 @@ export async function callTool(cfg, name, args = {}) {
   const errors = validateArgs(tool.inputSchema, args ?? {});
   if (errors.length) throw new TwilioError(`Invalid arguments: ${errors.join('; ')}`, 400);
   const a = args ?? {};
-  if (tool.twilio === false) return tool.handler(null, a, cfg);
+  // Every tool's output passes through the redactor: by key name, by value
+  // shape, and by exact value (the configured Twilio secret and access key).
+  const known = [cfg.apiKeySecret, cfg.authToken].filter(Boolean);
+  const finish = (out) => redactSecrets(out, { known });
+  if (tool.twilio === false) return finish(await tool.handler(null, a, cfg));
   if (!cfg.configured) {
-    if (tool.twilio === 'optional') return tool.handler(null, a, cfg);
+    if (tool.twilio === 'optional') return finish(await tool.handler(null, a, cfg));
     throw new TwilioError('This server is not connected to Twilio yet - open /setup, or set the TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID / TWILIO_API_KEY_SECRET secrets.', 503);
   }
-  return tool.handler(new TwilioClient(cfg), a, cfg);
+  return finish(await tool.handler(new TwilioClient(cfg), a, cfg));
 }
 
 // UI metadata - which tools are writes, and how they group on the landing page.

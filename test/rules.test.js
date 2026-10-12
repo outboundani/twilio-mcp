@@ -3,7 +3,7 @@
 // a blocklist guard, re-aimed at Twilio. They must all stay refused.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems, findDuplicateKeys, canonicalJson } from '../src/rules.js';
+import { checkRawCall, isAllowedWrite, redactSecrets, validateArgs, resolveHost, definitionProblems, findDuplicateKeys, canonicalJson, scrubReadResponse, redactText, ALLOWED_URL_HOSTS } from '../src/rules.js';
 
 const AC = `AC${'1'.repeat(32)}`;
 const OTHER = `AC${'2'.repeat(32)}`;
@@ -64,7 +64,7 @@ test('never dials: calls, conferences, and Studio Executions (read or write, any
   refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}/executions` }, /places a real outbound call/);
   refused({ host: 'studio', method: 'POST', path: `v2/Flows/${FW}/Executions/${FN}`, body: { Status: 'ended' } }, /places a real outbound call/);
   allowed({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions` });
-  allowed({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` });
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` }, /allowlist/); // caller PII, see F6
 });
 
 test('never sends: messages, SMS, conversations', () => {
@@ -254,4 +254,68 @@ test('F5: duplicate keys in a JSON string field are refused (parser-differential
   refused({ host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/Workflows`, body: { FriendlyName: 'w', Configuration: '{not json' } }, /not valid JSON/);
   assert.equal(canonicalJson('{"a":1}').value, '{"a":1}');
   assert.equal(canonicalJson('{"a":1,"a":2}').ok, false);
+});
+
+test('F6: Execution Steps and Context (caller PII) are not readable through the raw tool', () => {
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps` }, /allowlist/);
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Context` }, /allowlist/);
+  refused({ host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/${FN}/Steps/FT${'0'.repeat(32)}` }, /allowlist/);
+  // Execution rows themselves stay readable, minus caller fields.
+  const row = { sid: FN, status: 'ended', contact_channel_address: '+15555550123', context: { trigger: { call: { From: '+15555550123' } } }, contact_sid: 'FC1', nested: [{ context: 'x', ok: 1 }] };
+  const out = scrubReadResponse(`v2/Flows/${FW}/Executions`, { executions: [row] });
+  assert.equal(out.executions[0].status, 'ended');
+  assert.equal(out.executions[0].contact_channel_address, '[withheld: caller data]');
+  assert.equal(out.executions[0].context, '[withheld: caller data]');
+  assert.equal(out.executions[0].nested[0].context, '[withheld: caller data]');
+  assert.equal(out.executions[0].nested[0].ok, 1);
+  // Other resources are untouched.
+  assert.deepEqual(scrubReadResponse('v2/Flows', { context: 'keep' }), { context: 'keep' });
+});
+
+test('F6: redaction covers key names, value shapes, and exact known secrets', () => {
+  const r = redactSecrets({
+    access_token: 'abc', refresh_token: 'abc', Authorization: 'Bearer abcdef123456', bearer: 'x', apiKey: 'k', client_secret: 's',
+    set_vars: { key: 'greeting', value: 'hello' }, friendly_name: 'ok',
+  });
+  for (const k of ['access_token', 'refresh_token', 'Authorization', 'bearer', 'apiKey', 'client_secret']) assert.equal(r[k], '[redacted]', k);
+  assert.deepEqual(r.set_vars, { key: 'greeting', value: 'hello' }, 'a bare "key" field is not a secret (Studio set-variables)');
+  assert.equal(r.friendly_name, 'ok');
+  // Shapes inside strings, including a JSON document stored as a string.
+  assert.equal(redactSecrets('Authorization: Bearer abcdef123456 trailing'), 'Authorization: Bearer [redacted] trailing');
+  assert.equal(redactSecrets('curl -H "Authorization: Bearer abcdef123456"'), 'curl -H "Authorization: Bearer [redacted]"');
+  assert.equal(redactSecrets('token=abcd1234&x=1'), 'token=[redacted]&x=1');
+  assert.equal(redactSecrets('password: hunter2'), 'password: [redacted]');
+  assert.equal(redactSecrets('https://x.example/p?sig=abcdef&y=1'), 'https://x.example/p?sig=[redacted]&y=1');
+  assert.equal(redactSecrets('{"api_key":"abcd1234","n":1}'), '{"api_key":"[redacted]","n":1}');
+  assert.equal(redactSecrets('sent Bearer abc123def now'), 'sent Bearer [redacted] now');
+  // Exact known values are scrubbed anywhere, even without a telltale key.
+  assert.equal(redactSecrets({ note: 'the value is S3cr3tValue9 ok' }, { known: ['S3cr3tValue9'] }).note, 'the value is [redacted] ok');
+  assert.equal(redactSecrets({ note: 'ab' }, { known: ['ab'] }).note, 'ab', 'tiny values are not treated as secrets (would shred text)');
+  // Ordinary data is untouched.
+  assert.deepEqual(redactSecrets({ sid: AC, n: 3, ok: true, nil: null, list: ['a', 'b'] }), { sid: AC, n: 3, ok: true, nil: null, list: ['a', 'b'] });
+  assert.equal(redactText('no secrets here: 12345'), 'no secrets here: 12345');
+});
+
+test('F6: Studio definitions are walked recursively; URL-valued properties are refused unless allowlisted', () => {
+  const widget = (properties) => ({ states: [{ name: 'w', type: 'say-play', properties, transitions: [] }] });
+  // Top-level play URL.
+  assert.equal(definitionProblems(widget({ play: 'https://evil.example/hold.mp3' })).length, 1);
+  assert.equal(definitionProblems(widget({ play: '//evil.example/hold.mp3' })).length, 1);
+  // Deeply nested URL-named key and URL value.
+  assert.equal(definitionProblems(widget({ outer: { inner: [{ deep_url: 'x' }] } })).length, 1);
+  assert.equal(definitionProblems(widget({ outer: { inner: [{ media: 'https://evil.example/a.wav' }] } })).length, 1);
+  assert.equal(definitionProblems(widget({ variables: [{ key: 'cb', value: 'https://evil.example/x' }] })).length, 1);
+  // Plain text, including text that merely mentions a URL, is fine.
+  assert.deepEqual(definitionProblems(widget({ say: 'Visit example dot com', language: 'en-US', loop: 1 })), []);
+  assert.deepEqual(definitionProblems(widget({ say: 'see https://example.com for details' })), []);
+  // Explicit allowlist: exact host and wildcard subdomain; the *_url key rule is NOT overridable.
+  const allow = { allowedUrlHosts: ['media.example.org', '*.cdn.example.net'] };
+  assert.deepEqual(definitionProblems(widget({ play: 'https://media.example.org/a.mp3' }), allow), []);
+  assert.deepEqual(definitionProblems(widget({ play: 'https://a.cdn.example.net/a.mp3' }), allow), []);
+  assert.equal(definitionProblems(widget({ play: 'https://cdn.example.net/a.mp3' }), allow).length, 1, 'wildcard needs a real subdomain');
+  assert.equal(definitionProblems(widget({ play: 'https://media.example.org.evil.com/a.mp3' }), allow).length, 1, 'lookalike host');
+  assert.equal(definitionProblems(widget({ wait_url: 'https://media.example.org/a.mp3' }), allow).length, 1, '*_url keys stay refused');
+  assert.equal(ALLOWED_URL_HOSTS.length, 0, 'the default allowlist is empty');
+  // Through the raw tool.
+  refused({ host: 'studio', method: 'POST', path: 'v2/Flows', body: { FriendlyName: 'x', Status: 'draft', Definition: widget({ play: 'https://evil.example/hold.mp3' }) } }, /URL value at play/);
 });

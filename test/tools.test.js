@@ -380,3 +380,53 @@ test('F3: the raw tool will not UPDATE a live queue or workflow without confirm_
   await callTool(cfg, 'twilio_api_call', { host: 'taskrouter', method: 'POST', path: `v1/Workspaces/${WS}/TaskQueues`, body: { FriendlyName: 'New' } });
   assert.equal(calls.length, 2);
 });
+
+test('F6: every tool output is redacted, including known secrets and the static about text', async () => {
+  const secretCfg = { ...cfg, apiKeySecret: 'TopSecretValue12345', authToken: 'AccessKeyValue67890' };
+  stub({
+    'GET taskrouter.twilio.com/v1/Workspaces': () => ({ workspaces: [{ sid: WS, friendly_name: 'WS leaks TopSecretValue12345 and AccessKeyValue67890' }], meta: {} }),
+  });
+  const res = await callTool(secretCfg, 'list_workspaces', {});
+  assert.ok(!JSON.stringify(res).includes('TopSecretValue12345'));
+  assert.ok(!JSON.stringify(res).includes('AccessKeyValue67890'));
+  assert.match(res.workspaces[0].name, /\[redacted\]/);
+  // The redactor leaves the long static prose alone.
+  const { ABOUT } = await import('../src/about.js');
+  assert.equal(await callTool({ configured: false }, 'about'), ABOUT);
+});
+
+test('F6: raw reads of Executions withhold caller data; Steps and Context are refused', async () => {
+  const calls = stub({
+    [`GET studio.twilio.com/v2/Flows/${FW}/Executions`]: () => ({ executions: [{ sid: 'FN1', status: 'ended', contact_channel_address: '+15555550123', context: { x: 1 } }], meta: {} }),
+  });
+  const res = await callTool(cfg, 'twilio_api_call', { host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions` });
+  assert.equal(res.executions[0].status, 'ended');
+  assert.equal(res.executions[0].contact_channel_address, '[withheld: caller data]');
+  assert.equal(res.executions[0].context, '[withheld: caller data]');
+  await assert.rejects(callTool(cfg, 'twilio_api_call', { host: 'studio', method: 'GET', path: `v2/Flows/${FW}/Executions/FN${'8'.repeat(32)}/Steps` }), /allowlist/);
+  assert.equal(calls.length, 1);
+});
+
+test('F6: the client never follows redirects and times out stalled requests', async () => {
+  let seen;
+  globalThis.fetch = async (url, init) => { seen = init; return new Response('{}', { status: 200 }); };
+  const tw = new TwilioClient(cfg);
+  await tw.get('studio', 'v2/Flows');
+  assert.equal(seen.redirect, 'error');
+  assert.ok(seen.signal instanceof AbortSignal);
+  // A redirect (fetch throws under redirect: 'error') becomes a clean refusal, not a leaked URL.
+  globalThis.fetch = async () => { throw new TypeError('redirect mode is set to error: https://evil.example/'); };
+  await assert.rejects(tw.get('studio', 'v2/Flows'), (e) => e.name === 'TwilioError' && e.status === 502 && !/evil\.example/.test(e.message));
+  // A timeout is reported as such.
+  globalThis.fetch = async () => { const e = new Error('timed out'); e.name = 'TimeoutError'; throw e; };
+  await assert.rejects(tw.get('studio', 'v2/Flows'), (e) => e.status === 504 && /timed out after 15s/.test(e.message));
+});
+
+test('F6: build_ivr runs its composed flow through the same egress rails', async () => {
+  const w = twilioWorld();
+  const calls = stub(w.routes);
+  const spec = { name: 'Urlish', menu: { prompt: 'Press one.', options: [{ digit: '1', action: { type: 'hangup' } }] } };
+  const ok = await callTool(cfg, 'build_ivr', { spec, dry_run: true });
+  assert.equal(ok.valid, true);
+  assert.ok(calls.length > 0);
+});

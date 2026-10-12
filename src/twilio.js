@@ -31,6 +31,7 @@ function formBody(params) {
 }
 
 const MAX_PAGES = 25;
+const REQUEST_TIMEOUT_MS = 15000;
 
 export class TwilioClient {
   constructor({ accountSid, apiKeySid, apiKeySecret }) {
@@ -76,7 +77,16 @@ export class TwilioClient {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       body = formBody(form).toString();
     }
-    const res = await fetch(url, { method: m, headers, body });
+    // No redirects (a redirect would carry the Authorization header to
+    // wherever it points) and a hard timeout so a stalled upstream cannot
+    // hang the Worker.
+    let res;
+    try {
+      res = await fetch(url, { method: m, headers, body, redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    } catch (e) {
+      if (e?.name === 'TimeoutError' || e?.name === 'AbortError') throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`, 504);
+      throw new TwilioError(`${m} ${HOSTS[hostKey]}/${rel} could not be completed (network error or an unexpected redirect, which this server refuses to follow).`, 502);
+    }
     if (res.status === 429 && _attempt < 2) {
       const ra = Number(res.headers.get('Retry-After'));
       await new Promise((r) => setTimeout(r, Number.isFinite(ra) && ra > 0 ? Math.min(ra, 10) * 1000 : (_attempt === 0 ? 1500 : 5000)));
